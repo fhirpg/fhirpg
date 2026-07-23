@@ -11,6 +11,7 @@
 //! and the tally that makes skipped resources visible instead of leaving them
 //! in scrollback.
 
+pub mod copy;
 pub mod insert;
 
 use std::collections::BTreeMap;

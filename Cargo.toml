@@ -28,6 +28,9 @@ tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] } # Postgre
 native-tls = "0.2" # TLS backend. Chosen over rustls because its two danger switches map exactly onto libpq's four TLS sslmodes (spec §6).
 postgres-native-tls = "0.5" # Bridges native-tls to tokio-postgres.
 flate2 = "1" # gzip decoding; input compression is detected by content, not filename (spec §5.1).
+bytes = "1" # The buffer type tokio-postgres's COPY sink accepts.
+futures-util = { version = "0.3", default-features = false, features = ["sink"] } # SinkExt::send, for feeding the COPY sink.
+uuid = { version = "1.24", features = ["v7"] } # Client-side UUIDv7 for the copy loader, the third id-generation site (D12).
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -104,6 +104,10 @@ static FUNCTIONS_JSON: &str = include_str!("../assets/schema/functions.sql.json"
 /// exactly one version, so this is at most one parse per process.
 static TRANSFORM_CACHE: [OnceLock<TransformMap>; 9] = [const { OnceLock::new() }; 9];
 
+/// One resource-type table map per version, filled on first use.
+static RESOURCE_TABLE_CACHE: [OnceLock<BTreeMap<String, String>>; 9] =
+    [const { OnceLock::new() }; 9];
+
 impl FhirVersion {
     /// Returns the dotted version string, e.g. `"4.0.0"`.
     pub fn as_str(self) -> &'static str {
@@ -163,6 +167,65 @@ impl FhirVersion {
     /// Returns [`Error::Asset`] if the embedded JSON is not an array of strings.
     pub fn function_statements() -> Result<Vec<String>> {
         parse_statements(FUNCTIONS_JSON, "functions", "all")
+    }
+
+
+    /// The resource types this version's schema defines, mapped to their table
+    /// names.
+    ///
+    /// The authority for defect X2. A resource type arriving in input data is
+    /// only usable as a table name if it appears here; anything else is
+    /// rejected rather than interpolated into SQL. Derived from the schema
+    /// asset itself, so it cannot drift from what `init` actually created.
+    ///
+    /// Includes `Concept`, whose tables `init` appends in code rather than in
+    /// the asset (`dbinit.go:16-33`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Asset`] if the schema asset cannot be parsed.
+    pub fn resource_tables(self) -> Result<&'static BTreeMap<String, String>> {
+        let cell = RESOURCE_TABLE_CACHE
+            .get(self.index())
+            .ok_or_else(|| Error::Asset(format!("no schema asset for FHIR {self}")))?;
+
+        if let Some(tables) = cell.get() {
+            return Ok(tables);
+        }
+
+        let mut tables = BTreeMap::new();
+        for statement in self.schema_statements()? {
+            let Some((table, resource_type)) = parse_resource_table(&statement) else {
+                continue;
+            };
+            if table.ends_with("_history") {
+                continue;
+            }
+            tables.insert(resource_type, table);
+        }
+
+        tables.insert("Concept".to_owned(), "concept".to_owned());
+
+        if tables.len() < 50 {
+            return Err(Error::Asset(format!(
+                "FHIR {self} schema yielded only {} resource tables; the asset looks wrong",
+                tables.len()
+            )));
+        }
+
+        Ok(cell.get_or_init(|| tables))
+    }
+
+    /// Resolves a resource type from input data to a table name.
+    ///
+    /// Returns `None` for a type this version does not define. Callers MUST
+    /// quote the returned name; it is lower case and known-good, but quoting is
+    /// what makes `Group` work (spec §2.1).
+    pub fn table_for(self, resource_type: &str) -> Option<&'static str> {
+        self.resource_tables()
+            .ok()?
+            .get(resource_type)
+            .map(String::as_str)
     }
 
     /// Returns this version's transform map, parsing and validating it once.
@@ -235,6 +298,20 @@ fn parse_statements(raw: &str, kind: &str, version: &str) -> Result<Vec<String>>
             })
         })
         .collect()
+}
+
+/// Extracts `(table, resourceType)` from a `CREATE TABLE` statement.
+///
+/// The schema states the resource type twice — as the quoted table name and as
+/// the `resource_type` column default — and this reads both so a mismatch would
+/// be visible rather than assumed.
+fn parse_resource_table(statement: &str) -> Option<(String, String)> {
+    let rest = statement.strip_prefix("CREATE TABLE IF NOT EXISTS \"")?;
+    let (table, rest) = rest.split_once('"')?;
+    let marker = "resource_type text default '";
+    let (_, after) = rest.split_once(marker)?;
+    let (resource_type, _) = after.split_once('\'')?;
+    Some((table.to_owned(), resource_type.to_owned()))
 }
 
 /// What a transform node does to the value at its position (spec §4.1).
@@ -825,5 +902,71 @@ mod tests {
         }
 
         assert_eq!(checked, 19, "expected 10 schema assets and 9 transform maps");
+    }
+}
+
+#[cfg(test)]
+mod resource_table_tests {
+    use super::*;
+
+    #[test]
+    fn every_version_yields_a_plausible_table_map() {
+        // Counts read from the assets; pinned so a truncated asset is loud.
+        let expected: [(FhirVersion, usize); 9] = [
+            (FhirVersion::V1_0_2, 93),
+            (FhirVersion::V1_1_0, 103),
+            (FhirVersion::V1_4_0, 112),
+            (FhirVersion::V1_6_0, 109),
+            (FhirVersion::V1_8_0, 115),
+            (FhirVersion::V3_0_1, 117),
+            (FhirVersion::V3_2_0, 141),
+            (FhirVersion::V3_3_0, 138),
+            (FhirVersion::V4_0_0, 146),
+        ];
+        for (version, count) in expected {
+            let tables = version.resource_tables().unwrap();
+            assert_eq!(tables.len(), count, "FHIR {version} resource table count");
+        }
+    }
+
+    #[test]
+    fn the_table_name_is_the_lowercased_resource_type() {
+        for &version in ALL_VERSIONS {
+            for (resource_type, table) in version.resource_tables().unwrap() {
+                assert_eq!(
+                    *table,
+                    resource_type.to_lowercase(),
+                    "FHIR {version}: {resource_type} maps to {table}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_reserved_word_resource_type_is_present() {
+        // Defect X2's subject: `Group` lowercases to a PostgreSQL reserved word.
+        assert_eq!(FhirVersion::V4_0_0.table_for("Group"), Some("group"));
+        assert_eq!(FhirVersion::V4_0_0.table_for("Patient"), Some("patient"));
+        assert_eq!(FhirVersion::V4_0_0.table_for("Concept"), Some("concept"));
+    }
+
+    #[test]
+    fn unknown_and_hostile_resource_types_do_not_resolve() {
+        for hostile in [
+            "NoSuchResource",
+            "patient",
+            "PATIENT",
+            "",
+            "patient; DROP TABLE patient",
+            "patient\"",
+            "patient--",
+            "pg_class",
+        ] {
+            assert_eq!(
+                FhirVersion::V4_0_0.table_for(hostile),
+                None,
+                "{hostile:?} must not resolve to a table"
+            );
+        }
     }
 }

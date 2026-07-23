@@ -34,6 +34,11 @@ mod commands;
 mod config;
 mod db;
 mod error;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired to the load command in task T16")
+)]
+mod load;
 #[cfg(test)]
 mod procedures_suite;
 #[cfg(test)]

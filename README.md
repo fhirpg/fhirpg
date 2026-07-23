@@ -57,7 +57,7 @@ recorded as decisions D1–D14 in [`plan.md`](plan.md). The ones you would notic
 - **Generated ids are UUIDv7**, not v4, so they sort by creation time and index
   better on bulk loads. They do embed a creation timestamp.
 
-It also fixes fifteen defects catalogued in the Go original (X1–X15 in
+It also fixes sixteen defects catalogued in the Go original (X1–X16 in
 [`plan.md`](plan.md)), including an SQL injection vector in the insert loader,
 a cleartext password in the connection banner, and an inability to load FHIR
 `Group` resources at all.

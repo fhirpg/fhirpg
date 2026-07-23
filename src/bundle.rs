@@ -4,7 +4,10 @@
 //! nothing about the database; the loaders above it know about the database and
 //! nothing about file formats (see `AGENTS/architecture.md`).
 //!
-//! Modules appear as their tasks land: `detect` (T12), then the readers
-//! themselves — `ndjson`, `fhir_bundle`, `single`, `multifile` (T13).
+//! [`detect`] classifies a file, [`scanner`] walks JSON without materializing
+//! it, and [`reader`] turns a file or a list of files into an iterator of
+//! resources.
 
 pub mod detect;
+pub mod reader;
+pub mod scanner;

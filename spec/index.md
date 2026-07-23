@@ -686,6 +686,6 @@ be built; [`../tasks.md`](../tasks.md) sequences the work; each task names the
 sections it satisfies.
 
 Divergences from fhirbase are deliberate and enumerated in
-[`../plan.md`](../plan.md): fifteen defect fixes (X1–X15) and fourteen decisions
+[`../plan.md`](../plan.md): sixteen defect fixes (X1–X16) and fourteen decisions
 (D1–D14). Nothing else in the observable behaviour may differ without a spec
 change landing first.

@@ -11,6 +11,7 @@
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
+use crate::bundle::scanner::Scanner;
 use crate::error::{Error, Result};
 
 /// The three input formats (spec §5.2).
@@ -104,39 +105,67 @@ pub fn detect(path: &Path) -> Result<BundleFormat> {
     guess_format(reader, &path.display().to_string())
 }
 
+/// How much of a file detection may buffer.
+///
+/// Detection needs the first two lines, and reading them with `read_line` would
+/// buffer the whole file when it contains no newline — which is exactly what a
+/// compact FHIR Bundle is. That is defect X16, inherited from fhirbase's
+/// `bufio.Reader.ReadString('\n')`, and measured: a 1 GB single-line Bundle
+/// grew RSS by 1,003 MB before this cap existed.
+///
+/// 1 MiB is far beyond any plausible NDJSON line while still being a constant.
+const DETECTION_PREFIX_LIMIT: usize = 1024 * 1024;
+
 /// Classifies an already-opened, already-decoded stream.
+///
+/// Reads at most [`DETECTION_PREFIX_LIMIT`] bytes, whatever the file's size
+/// (spec invariant 6).
 ///
 /// # Errors
 ///
 /// Returns [`Error::Bundle`] if the stream cannot be read or its root is not a
 /// JSON object.
 pub fn guess_format(mut reader: Box<dyn BufRead>, source: &str) -> Result<BundleFormat> {
-    let mut first = String::new();
-    let read = reader
-        .read_line(&mut first)
-        .map_err(|e| Error::bundle(source, format!("cannot read: {e}")))?;
-
-    // No trailing newline means this was the only line, so there is nothing to
-    // compare it against: fall straight through to inspecting the JSON.
-    if read == 0 || !first.ends_with('\n') {
-        return classify_json(std::io::Cursor::new(first).chain(reader), source);
+    let mut prefix = Vec::new();
+    {
+        let mut limited = reader.by_ref().take(DETECTION_PREFIX_LIMIT as u64);
+        limited
+            .read_to_end(&mut prefix)
+            .map_err(|e| Error::bundle(source, format!("cannot read: {e}")))?;
     }
 
-    let mut second = String::new();
-    reader
-        .read_line(&mut second)
-        .map_err(|e| Error::bundle(source, format!("cannot read: {e}")))?;
-
-    // Two complete objects on two lines: NDJSON. Note `second` may be empty —
-    // see `is_complete_json_object` — so a lone newline-terminated resource is
-    // NDJSON, which is both fhirbase's behaviour and the right answer, since a
-    // one-line NDJSON file is still NDJSON.
-    if is_complete_json_object(&first) && is_complete_json_object(&second) {
-        return Ok(BundleFormat::Ndjson);
+    if prefix.is_empty() {
+        return Err(Error::bundle(source, "the file is empty"));
     }
 
-    let head = format!("{first}{second}");
-    classify_json(std::io::Cursor::new(head).chain(reader), source)
+    // Split the prefix into its first two lines, if it has them. A file whose
+    // first line exceeds the cap has no second line worth comparing, so it
+    // falls through to the JSON inspection below — which is the right answer
+    // for the case that motivates the cap, a single-line Bundle.
+    if let Some(first_end) = prefix.iter().position(|&b| b == b'\n') {
+        let first = &prefix[..=first_end];
+        let rest = &prefix[first_end + 1..];
+        let second_end = rest.iter().position(|&b| b == b'\n');
+        let second = match second_end {
+            Some(end) => &rest[..=end],
+            None => rest,
+        };
+
+        // Two complete objects on two lines: NDJSON. Note `second` may be empty
+        // — see `is_complete_json_object` — so a lone newline-terminated
+        // resource is NDJSON, which is both fhirbase's behaviour and the right
+        // answer, since a one-line NDJSON file is still NDJSON.
+        let (Ok(first), Ok(second)) = (std::str::from_utf8(first), std::str::from_utf8(second))
+        else {
+            return Err(Error::bundle(source, "the file is not valid UTF-8"));
+        };
+
+        if is_complete_json_object(first) && is_complete_json_object(second) {
+            return Ok(BundleFormat::Ndjson);
+        }
+    }
+
+    classify_json(std::io::Cursor::new(prefix).chain(reader), source)
 }
 
 /// Decides between a FHIR Bundle and a single resource by finding
@@ -229,162 +258,6 @@ fn scan_root_resource_type<R: Read>(reader: R, source: &str) -> Result<Option<St
         }
 
         scanner.skip_value()?;
-    }
-}
-
-/// A minimal byte-level JSON scanner, enough to walk one object's keys.
-///
-/// Buffered internally: the scanner reads a byte at a time, which would be a
-/// syscall per byte over a bare `File`.
-struct Scanner<R: Read> {
-    bytes: std::io::Bytes<BufReader<R>>,
-    peeked: Option<u8>,
-    source: String,
-}
-
-impl<R: Read> Scanner<R> {
-    fn new(reader: R, source: &str) -> Self {
-        Self {
-            bytes: BufReader::new(reader).bytes(),
-            peeked: None,
-            source: source.to_owned(),
-        }
-    }
-
-    fn next_byte(&mut self) -> Result<Option<u8>> {
-        if let Some(b) = self.peeked.take() {
-            return Ok(Some(b));
-        }
-        match self.bytes.next() {
-            None => Ok(None),
-            Some(Ok(b)) => Ok(Some(b)),
-            Some(Err(e)) => Err(Error::bundle(&self.source, format!("cannot read: {e}"))),
-        }
-    }
-
-    fn peek_byte(&mut self) -> Result<Option<u8>> {
-        if self.peeked.is_none() {
-            self.peeked = self.next_byte()?;
-        }
-        Ok(self.peeked)
-    }
-
-    fn skip_whitespace(&mut self) -> Result<()> {
-        while let Some(b) = self.peek_byte()? {
-            if b.is_ascii_whitespace() {
-                self.next_byte()?;
-            } else {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    /// Reads a JSON string, assuming the opening quote is next.
-    fn read_string(&mut self) -> Result<String> {
-        match self.next_byte()? {
-            Some(b'"') => {}
-            _ => return Err(Error::bundle(&self.source, "expected a string")),
-        }
-
-        let mut raw = Vec::new();
-        loop {
-            match self.next_byte()? {
-                None => return Err(Error::bundle(&self.source, "unterminated string")),
-                Some(b'"') => break,
-                Some(b'\\') => {
-                    let escape = self
-                        .next_byte()?
-                        .ok_or_else(|| Error::bundle(&self.source, "unterminated escape"))?;
-                    match escape {
-                        b'"' => raw.push(b'"'),
-                        b'\\' => raw.push(b'\\'),
-                        b'/' => raw.push(b'/'),
-                        b'b' => raw.push(0x08),
-                        b'f' => raw.push(0x0c),
-                        b'n' => raw.push(b'\n'),
-                        b'r' => raw.push(b'\r'),
-                        b't' => raw.push(b'\t'),
-                        b'u' => {
-                            // Only the key comparison and the resourceType value
-                            // matter here, and both are ASCII in practice. Keep
-                            // the four hex digits verbatim rather than decoding
-                            // surrogate pairs: it cannot match "resourceType"
-                            // or a resource type name either way.
-                            for _ in 0..4 {
-                                match self.next_byte()? {
-                                    Some(b) => raw.push(b),
-                                    None => {
-                                        return Err(Error::bundle(
-                                            &self.source,
-                                            "unterminated \\u escape",
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        other => raw.push(other),
-                    }
-                }
-                Some(b) => raw.push(b),
-            }
-        }
-
-        String::from_utf8(raw)
-            .map_err(|e| Error::bundle(&self.source, format!("a string is not valid UTF-8: {e}")))
-    }
-
-    /// Skips one JSON value, however deeply nested.
-    fn skip_value(&mut self) -> Result<()> {
-        let mut depth: usize = 0;
-
-        loop {
-            match self.peek_byte()? {
-                None => return Err(Error::bundle(&self.source, "unexpected end of input")),
-                Some(b'"') => {
-                    self.read_string()?;
-                    if depth == 0 {
-                        return Ok(());
-                    }
-                }
-                Some(b'{' | b'[') => {
-                    self.next_byte()?;
-                    depth += 1;
-                }
-                Some(b'}' | b']') => {
-                    // A closing brace at depth 0 belongs to the parent object,
-                    // so leave it for the caller.
-                    if depth == 0 {
-                        return Ok(());
-                    }
-                    self.next_byte()?;
-                    depth -= 1;
-                    if depth == 0 {
-                        return Ok(());
-                    }
-                }
-                Some(b',') => {
-                    if depth == 0 {
-                        return Ok(());
-                    }
-                    self.next_byte()?;
-                }
-                Some(_) => {
-                    // A scalar: number, true, false, or null.
-                    self.next_byte()?;
-                    if depth == 0 {
-                        // Run to the end of the token.
-                        while let Some(b) = self.peek_byte()? {
-                            if b == b',' || b == b'}' || b == b']' || b.is_ascii_whitespace() {
-                                break;
-                            }
-                            self.next_byte()?;
-                        }
-                        return Ok(());
-                    }
-                }
-            }
-        }
     }
 }
 

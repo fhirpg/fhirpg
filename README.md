@@ -32,6 +32,27 @@ GROUP BY 1
 ORDER BY 2 DESC;
 ```
 
+## Performance
+
+Measured against fhirbase itself on its own demo bundle — 127,454 resources —
+against PostgreSQL 18.4. Full method and caveats in
+[`doc/benchmarks.md`](doc/benchmarks.md).
+
+| Input | Mode | fhirbase | fhirpg |
+| --- | --- | ---: | ---: |
+| non-grouped | `insert` | 4.95 s | **3.39 s** |
+| non-grouped | `copy` | 43.58 s | **43.23 s** |
+| grouped | `copy` | — | **1.20 s** |
+
+Copy mode is 2.5× faster than insert on grouped input and 13× slower on
+non-grouped, which is why the default depends on the source: `insert` for local
+files, `copy` for Bulk Data, which arrives grouped.
+
+Worth knowing before you compare yourself: **fhirbase cannot connect to
+PostgreSQL 18 at all** with default authentication — its 2018-vintage driver
+predates SCRAM-SHA-256. The benchmark only runs against a server reconfigured
+for trust authentication.
+
 ## Requirements
 
 - **PostgreSQL 18 or newer.** The stored procedures use `uuidv7()` for

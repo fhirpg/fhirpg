@@ -10,7 +10,7 @@
 #
 #   podman run -d --name fhirpg-db -p 5433:5432 \
 #     -e POSTGRES_USER=fhirpg -e POSTGRES_PASSWORD=fhirpg -e POSTGRES_DB=fhirpg \
-#     -v fhirpg-pgdata:/var/lib/postgresql/data \
+#     -v fhirpg-pgdata:/var/lib/postgresql \
 #     docker.io/library/postgres:18
 #
 # Then:
@@ -42,7 +42,13 @@ services:
       # A named volume rather than a bind mount: rootless Podman maps user
       # namespaces, and a bind mount into the host filesystem hits ownership
       # problems that a named volume avoids.
-      - fhirpg-pgdata:/var/lib/postgresql/data
+      #
+      # Mounted at /var/lib/postgresql, NOT .../data. PostgreSQL 18's official
+      # image stores data in a major-version-specific subdirectory so that
+      # pg_upgrade --link works without crossing a mount boundary, and it
+      # refuses to start if it finds an unused mount at the old .../data path.
+      # See https://github.com/docker-library/postgres/pull/1259
+      - fhirpg-pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U fhirpg -d fhirpg"]
       interval: 2s

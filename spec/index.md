@@ -668,8 +668,29 @@ For each element path in the metadata:
 
 ### 10.3 Verification
 
-Because the assets are generated once rather than reproduced from an oracle,
-correctness rests on four checks, all of which are requirements:
+An oracle exists after all, contrary to what decision D5 assumed. The sibling
+`fhir` crate ships the official StructureDefinitions for R3, R4, **and** R5, and
+fhirbase generated its own maps from the same source — so the generator can be
+run against R3 and R4 and diffed against fhirbase's vendored 3.0.1 and 4.0.0
+assets.
+
+It MUST reproduce them. Measured (see `doc/r5-generation/validation.md`):
+
+| Release | Compared against | Shared nodes | Identical |
+| --- | --- | ---: | ---: |
+| R3 | fhirbase 3.0.1 | 126 | 126 (100%) |
+| R4 | fhirbase 4.0.0 | 155 | 151 (97%) |
+
+The four R4 differences are a specification change, not a defect: FHIR's open
+type list gained `Meta` between 4.0.0 and 4.0.1, and 4.0.1 is the R4 the crate
+ships.
+
+The generator MUST read the specification JSON directly rather than the `fhir`
+crate's API, so that `fhir` is a dependency of nothing and cannot block
+publication (risk R5).
+
+Beyond the oracle, correctness rests on four further checks, all of which are
+requirements:
 
 1. **Structural.** Both files parse; every `tr/move` target resolves; every
    table name is unique, lowercase, and quoted; the resource-type count is 158.

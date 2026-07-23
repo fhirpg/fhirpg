@@ -1,0 +1,35 @@
+[package]
+name = "fhirpg"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+authors = ["Joel Parker Henderson <joel@joelparkerhenderson.com>"]
+description = "Import FHIR data into PostgreSQL and work with it relationally. A Rust translation of fhirbase."
+readme = "README.md"
+repository = "https://github.com/joelparkerhenderson/fhirpg/"
+license = "MIT OR Apache-2.0 OR GPL-2.0-only"
+keywords = ["fhir", "postgresql", "healthcare", "etl", "ndjson"]
+categories = ["command-line-utilities", "database", "science"]
+include = [
+    "/src/**",
+    "/assets/**",
+    "/README.md",
+    "/LICENSE.md",
+    "/CHANGELOG.md",
+]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] } # Command-line argument parser; `env` backs the libpq PG* variables (spec §6).
+thiserror = "2.0" # Derive macro for the typed error enum in `src/error.rs`.
+anyhow = "1.0" # Boundary error type: `main` only, never in library code.
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Spec invariant 2: no code path reachable from input may panic. These lints
+# make that a mechanical check rather than a code-review promise.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

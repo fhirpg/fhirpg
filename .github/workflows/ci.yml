@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-targets
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Must pass with no database, no network, no container runtime.
+      - run: cargo test
+      - run: cargo test --doc
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+
+  doc:
+    name: Docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-targets
+      - run: cargo test
+
+  database:
+    name: Database tests (PostgreSQL 18)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # GitHub Actions' `services:` block is Docker-backed, so it cannot be used
+      # here: this project standardizes on Podman (decision D11). Podman is
+      # preinstalled on the Ubuntu runners, so start the container explicitly.
+      - name: Start PostgreSQL 18 under Podman
+        run: |
+          podman run -d --name fhirpg-db -p 5433:5432 \
+            -e POSTGRES_USER=fhirpg \
+            -e POSTGRES_PASSWORD=fhirpg \
+            -e POSTGRES_DB=fhirpg \
+            docker.io/library/postgres:18
+
+      # Poll pg_isready rather than relying on a Compose healthcheck, which a
+      # bare `podman run` does not give us.
+      - name: Wait for PostgreSQL
+        run: |
+          for i in $(seq 1 30); do
+            if podman exec fhirpg-db pg_isready -U fhirpg -d fhirpg; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "PostgreSQL did not become ready in time" >&2
+          podman logs fhirpg-db >&2
+          exit 1
+
+      - name: Confirm the server is PostgreSQL 18 or newer
+        run: |
+          podman exec fhirpg-db psql -U fhirpg -d fhirpg -tAc 'SHOW server_version'
+
+      - name: Run the ignored database tests
+        env:
+          FHIRPG_TEST_DB: host=localhost port=5433 user=fhirpg password=fhirpg dbname=fhirpg
+        run: cargo test -- --ignored
+
+      - name: Container logs on failure
+        if: failure()
+        run: podman logs fhirpg-db
+
+  publish-dry-run:
+    name: Publish dry-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo publish --dry-run

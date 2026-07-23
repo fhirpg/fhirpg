@@ -1,0 +1,422 @@
+//! The command-line interface.
+//!
+//! Ports `main.go:30-308`. Flag names, short forms, and defaults match fhirbase
+//! except where a decision says otherwise (spec §7):
+//!
+//! - `--fhir` defaults to `5.0.0` rather than `3.3.0` (decision D4).
+//! - `--webhost` defaults to `127.0.0.1` rather than every interface, because
+//!   the web console executes arbitrary SQL without authentication (defect X11).
+//! - `--nostats` is gone, along with the telemetry it disabled (decision D1).
+//! - `--memusage` reports operating-system RSS, not Go GC statistics (D14).
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+/// The banner shown at the top of `--help`, as fhirbase does (`main.go:21-28`).
+const BANNER: &str = r"
+ ___  _  _  ___  ___  ___    ___
+| __|| || ||_ _|| _ \| _ \  / __|
+| _| | __ | | | |   /|  _/ | (_ |
+|_|  |_||_||___||_|_\|_|    \___|
+";
+
+/// A password that does not leak into logs, help text, or error messages.
+///
+/// fhirbase prints the password in cleartext in its connection banner, in two
+/// places (`db.go:79`, `web.go:140`); that is defect X6. Making the type itself
+/// redact is what stops it recurring: there is no way to format this except
+/// through [`Password::expose`].
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Password(String);
+
+// The tests below exercise both methods, so the expectation applies only to the
+// non-test build, where the connection builder that will call them (task T9)
+// does not exist yet.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the connection builder in task T9")
+)]
+impl Password {
+    /// Returns the password. Call this only when handing it to the driver.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Returns true when no password was supplied.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<String> for Password {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl std::str::FromStr for Password {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(Self(s.to_owned()))
+    }
+}
+
+impl std::fmt::Debug for Password {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_empty() {
+            "Password(<unset>)"
+        } else {
+            "Password(<redacted>)"
+        })
+    }
+}
+
+impl std::fmt::Display for Password {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_empty() {
+            "<unset>"
+        } else {
+            "<redacted>"
+        })
+    }
+}
+
+/// PostgreSQL TLS negotiation policy, matching libpq's six values (spec §6).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum SslMode {
+    /// Plaintext only.
+    Disable,
+    /// Plaintext first, TLS fallback.
+    Allow,
+    /// TLS first without certificate verification, plaintext fallback.
+    Prefer,
+    /// TLS required, certificate not verified.
+    Require,
+    /// TLS required, certificate chain verified.
+    VerifyCa,
+    /// TLS required, chain and hostname verified.
+    VerifyFull,
+}
+
+/// How the loader writes resources into the database (spec §8.1).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum LoadMode {
+    /// Batched `INSERT ... ON CONFLICT DO NOTHING`. Order-insensitive, tolerates
+    /// duplicate ids, performs the same on grouped and non-grouped input.
+    Insert,
+    /// `COPY ... FROM STDIN`, one run per consecutive same-typed group. Roughly
+    /// three times faster on grouped input, slower on non-grouped input.
+    Copy,
+}
+
+/// Import FHIR data into PostgreSQL and work with it relationally.
+#[derive(Debug, Parser)]
+#[command(
+    name = "fhirpg",
+    version,
+    about = "Import FHIR data into PostgreSQL and work with it relationally.",
+    before_help = BANNER,
+    long_about = None,
+)]
+pub struct Cli {
+    /// PostgreSQL connection settings, shared by every subcommand.
+    #[command(flatten)]
+    pub connection: ConnectionArgs,
+
+    /// FHIR version to use.
+    #[arg(
+        short = 'f',
+        long = "fhir",
+        global = true,
+        default_value = "5.0.0",
+        value_name = "VERSION",
+        help = "FHIR version to use"
+    )]
+    pub fhir: String,
+
+    /// The subcommand to run.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+/// The PostgreSQL connection settings (`main.go:42-94`, spec §6).
+///
+/// Precedence is explicit flag, then environment variable, then default —
+/// which is what `clap`'s `env` feature gives us for free.
+#[derive(Debug, Args)]
+pub struct ConnectionArgs {
+    /// PostgreSQL host.
+    #[arg(short = 'n', long, global = true, env = "PGHOST", default_value = "localhost")]
+    pub host: String,
+
+    /// PostgreSQL port.
+    #[arg(short = 'p', long, global = true, env = "PGPORT", default_value_t = 5432)]
+    pub port: u16,
+
+    /// PostgreSQL username.
+    #[arg(short = 'U', long, global = true, env = "PGUSER", default_value = "postgres")]
+    pub username: String,
+
+    /// Database to connect to.
+    #[arg(short = 'd', long = "db", global = true, env = "PGDATABASE", default_value = "")]
+    pub database: String,
+
+    /// PostgreSQL password.
+    #[arg(
+        short = 'W',
+        long,
+        global = true,
+        env = "PGPASSWORD",
+        default_value = "",
+        hide_default_value = true
+    )]
+    pub password: Password,
+
+    /// PostgreSQL sslmode setting.
+    #[arg(
+        short = 's',
+        long,
+        global = true,
+        env = "PGSSLMODE",
+        value_enum,
+        default_value_t = SslMode::Prefer
+    )]
+    pub sslmode: SslMode,
+}
+
+/// The five subcommands (spec §7).
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Create the fhirpg schema in a database.
+    #[command(long_about = "\
+Creates the SQL schema — tables, types, and stored procedures — to store
+resources from the FHIR version given by --fhir, in the database given by --db.
+
+The target database should be empty; otherwise the command may fail with an SQL
+error.
+
+PostgreSQL 18 or newer is required.")]
+    Init,
+
+    /// Apply the fhirpg transformation to a single FHIR resource from a file.
+    #[command(long_about = "\
+Applies the fhirpg transformation algorithm to a single FHIR resource loaded
+from the given JSON file, and writes the result to stdout.
+
+This command exists mostly to demonstrate and debug the transformation, which
+is what rewrites a FHIR resource into the representation stored in the
+`resource` jsonb column. See spec section 4 for the algorithm.")]
+    Transform {
+        /// Path to a JSON file holding one FHIR resource.
+        #[arg(value_name = "FILE")]
+        file: std::path::PathBuf,
+    },
+
+    /// Load FHIR resources into the database.
+    #[command(long_about = "\
+Loads FHIR resources from the named sources into the database.
+
+Provide either a single Bulk Data URL, or one or more file or directory paths.
+
+fhirpg reads these file types:
+
+  * NDJSON files
+  * transaction or collection FHIR Bundles
+  * plain JSON files holding a single FHIR resource
+
+Any of them may additionally be gzipped. Compression and format are detected
+from the file's content, not its name, so extensions may be omitted and formats
+may be mixed in one invocation:
+
+  fhirpg load *.ndjson.gz patient-john-doe.json my-tx-bundle.json
+
+Directory arguments are walked recursively.
+
+Two write modes are available. Insert mode uses batched INSERT statements; copy
+mode uses COPY FROM STDIN. Insert is the default for local files, copy for Bulk
+Data URLs.
+
+Copy mode is roughly three times faster when the input is *grouped* — all
+resources of a type adjacent, as Bulk Data exports are — and slower when it is
+not. Insert mode performs the same either way, and tolerates duplicate ids by
+keeping the first occurrence. When unsure, use insert.")]
+    Load {
+        /// A Bulk Data URL, or one or more file or directory paths.
+        #[arg(value_name = "URL_OR_PATH", required = true)]
+        sources: Vec<String>,
+
+        /// Write mode to use.
+        #[arg(short = 'm', long, value_enum)]
+        mode: Option<LoadMode>,
+
+        /// Abort the run on the first resource that cannot be transformed,
+        /// instead of skipping it and reporting a tally at the end.
+        #[arg(long)]
+        strict: bool,
+
+        /// Count resources up front for an exact progress total. Costs a full
+        /// extra read, which for compressed input means inflating twice.
+        #[arg(long)]
+        count_first: bool,
+
+        /// Report process resident set size (RSS) during the load.
+        ///
+        /// Note this is RSS, not heap allocation: fhirbase's flag of the same
+        /// name prints Go garbage-collector statistics, which have no Rust
+        /// equivalent.
+        #[arg(long)]
+        memusage: bool,
+
+        /// Bulk Data options, used only when the source is a URL.
+        #[command(flatten)]
+        bulk: BulkArgs,
+    },
+
+    /// Download FHIR data from a Bulk Data API endpoint into a directory.
+    #[command(long_about = "\
+Downloads FHIR data from a Bulk Data API endpoint and saves the NDJSON files it
+produces into a directory on the local filesystem.
+
+Files are downloaded in parallel; set the number of workers with --numdl.
+
+Bulk Data API implementations differ in what they accept, so --accept-header
+sets the Accept request header. You will usually not need it, but if a server
+rejects the request, set it to what that server expects.")]
+    Bulkget {
+        /// The Bulk Data API endpoint to export from.
+        #[arg(value_name = "URL")]
+        url: String,
+
+        /// Directory to write the downloaded NDJSON files into.
+        #[arg(value_name = "DIR")]
+        dir: std::path::PathBuf,
+
+        /// Bulk Data options.
+        #[command(flatten)]
+        bulk: BulkArgs,
+    },
+
+    /// Serve a web UI for running SQL queries from a browser.
+    #[command(long_about = "\
+Starts a small web server offering a browser UI for running SQL queries.
+
+SECURITY: the query endpoint executes arbitrary SQL against the database with
+no authentication. That is the feature, and it is why the server binds to
+127.0.0.1 by default. Setting --webhost to anything else exposes an
+unauthenticated database console on the network. Do not do that on an untrusted
+network, and never on a database holding real patient data.")]
+    Web {
+        /// Port to serve on.
+        #[arg(long, default_value_t = 3000)]
+        webport: u16,
+
+        /// Address to bind. Anything other than a loopback address exposes an
+        /// unauthenticated SQL console on the network.
+        #[arg(long, default_value = "127.0.0.1")]
+        webhost: String,
+    },
+}
+
+/// Options shared by `load` (when given a URL) and `bulkget`.
+#[derive(Debug, Args)]
+pub struct BulkArgs {
+    /// Number of parallel downloads for the Bulk Data API client.
+    #[arg(long, default_value_t = 5)]
+    pub numdl: u16,
+
+    /// Value for the Accept HTTP header.
+    #[arg(long, default_value = "application/fhir+json")]
+    pub accept_header: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn defaults_match_the_spec() {
+        let cli = Cli::try_parse_from(["fhirpg", "init"]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(cli.fhir, "5.0.0", "spec §3: default FHIR version is R5");
+        assert_eq!(cli.connection.host, "localhost");
+        assert_eq!(cli.connection.port, 5432);
+        assert_eq!(cli.connection.username, "postgres");
+        assert_eq!(cli.connection.sslmode, SslMode::Prefer);
+    }
+
+    #[test]
+    fn web_binds_loopback_by_default() {
+        let cli = Cli::try_parse_from(["fhirpg", "web"]).unwrap_or_else(|e| panic!("{e}"));
+        match cli.command {
+            Some(Command::Web { webhost, webport }) => {
+                assert_eq!(webhost, "127.0.0.1", "defect X11: must not bind the world");
+                assert_eq!(webport, 3000);
+            }
+            other => panic!("expected the web subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn short_flags_match_fhirbase() {
+        let cli = Cli::try_parse_from([
+            "fhirpg", "-n", "db.example", "-p", "6543", "-U", "alice", "-d", "clinic", "-W",
+            "hunter2", "-s", "require", "-f", "4.0.0", "init",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(cli.connection.host, "db.example");
+        assert_eq!(cli.connection.port, 6543);
+        assert_eq!(cli.connection.username, "alice");
+        assert_eq!(cli.connection.database, "clinic");
+        assert_eq!(cli.connection.sslmode, SslMode::Require);
+        assert_eq!(cli.fhir, "4.0.0");
+        assert_eq!(cli.connection.password.expose(), "hunter2");
+    }
+
+    #[test]
+    fn password_never_renders_in_the_clear() {
+        let password = Password::from("hunter2".to_owned());
+        assert_eq!(format!("{password}"), "<redacted>");
+        assert_eq!(format!("{password:?}"), "Password(<redacted>)");
+        assert!(!format!("{password} {password:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn empty_password_is_distinguishable_from_a_set_one() {
+        let password = Password::default();
+        assert!(password.is_empty());
+        assert_eq!(format!("{password}"), "<unset>");
+    }
+
+    #[test]
+    fn load_requires_at_least_one_source() {
+        assert!(Cli::try_parse_from(["fhirpg", "load"]).is_err());
+    }
+
+    #[test]
+    fn load_mode_is_unset_unless_given() {
+        let cli = Cli::try_parse_from(["fhirpg", "load", "a.ndjson"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match cli.command {
+            // Spec §8.1: the default depends on whether the source is a URL, so
+            // it cannot be a clap default — it must stay None here.
+            Some(Command::Load { mode, sources, .. }) => {
+                assert_eq!(mode, None);
+                assert_eq!(sources, vec!["a.ndjson".to_owned()]);
+            }
+            other => panic!("expected the load subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_subcommand_parses_and_leaves_command_unset() {
+        let cli = Cli::try_parse_from(["fhirpg"]).unwrap_or_else(|e| panic!("{e}"));
+        assert!(cli.command.is_none(), "spec §7: prints help and exits 0");
+    }
+}

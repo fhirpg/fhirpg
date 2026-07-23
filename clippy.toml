@@ -1,0 +1,10 @@
+# Proper nouns and initialisms that `clippy::doc_markdown` should not demand
+# backticks around. ".." keeps clippy's own defaults in addition to these.
+doc-valid-idents = [
+    "..",
+    "PostgreSQL",
+    "NDJSON",
+    "UUIDv7",
+    "fhirbase",
+    "fhirpg",
+]

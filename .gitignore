@@ -1,0 +1,8 @@
+/target
+
+# Podman/Compose local PostgreSQL state, if a bind mount is ever used in place
+# of the named volume in compose.yaml.
+/.pgdata/
+
+# mdBook build output (Phase 6).
+/book/book/

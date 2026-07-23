@@ -5,8 +5,9 @@
 //! and delegates the actual work to the layers below (see
 //! `AGENTS/architecture.md`).
 //!
-//! Modules appear as their tasks land: `transform` (T7), `init` (T11), then
-//! `load` (T16), `bulkget` (T18), and `web` (T20).
+//! Modules appear as their tasks land: `transform` (T7), `init` (T11),
+//! `load` (T16), then `bulkget` (T18) and `web` (T20).
 
 pub mod init;
+pub mod load;
 pub mod transform;

@@ -24,21 +24,14 @@
     expect(dead_code, reason = "schema accessors are consumed by tasks T11-T15")
 )]
 mod assets;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the bundle readers in task T13")
-)]
 mod bundle;
 mod cli;
 mod commands;
 mod config;
 mod db;
 mod error;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired to the load command in task T16")
-)]
 mod load;
+mod memory;
 #[cfg(test)]
 mod procedures_suite;
 #[cfg(test)]
@@ -88,10 +81,26 @@ fn run(cli: &Cli) -> error::Result<()> {
             runtime()?.block_on(commands::init::run(&config, version))
         }
         Command::Transform { file } => commands::transform::run(file, version),
-        Command::Load { .. } => Err(Error::NotImplemented {
-            command: "load",
-            task: "T16",
-        }),
+        Command::Load {
+            sources,
+            mode,
+            strict,
+            count_first,
+            memusage,
+            txid,
+            ..
+        } => {
+            let config = PgConfig::from_args(&cli.connection);
+            let request = commands::load::LoadRequest {
+                sources: sources.clone(),
+                mode: *mode,
+                strict: *strict,
+                count_first: *count_first,
+                memusage: *memusage,
+                new_txid: txid.is_some(),
+            };
+            runtime()?.block_on(commands::load::run(&config, version, &request))
+        }
         Command::Bulkget { .. } => Err(Error::NotImplemented {
             command: "bulkget",
             task: "T18",

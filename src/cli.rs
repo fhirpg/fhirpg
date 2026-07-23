@@ -92,6 +92,14 @@ pub enum SslMode {
     VerifyFull,
 }
 
+/// What transaction id a load run writes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum TxidMode {
+    /// Take the next value from `transaction_id_seq`.
+    New,
+}
+
 /// How the loader writes resources into the database (spec §8.1).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lower")]
@@ -258,6 +266,14 @@ keeping the first occurrence. When unsure, use insert.")]
         /// extra read, which for compressed input means inflating twice.
         #[arg(long)]
         count_first: bool,
+
+        /// Allocate a real transaction id for this run instead of writing 0.
+        ///
+        /// fhirbase hardcodes `txid = 0` for every bulk-loaded resource, which
+        /// leaves them outside the history mechanism the stored procedures use
+        /// (defect X10).
+        #[arg(long = "txid", value_name = "new")]
+        txid: Option<TxidMode>,
 
         /// Report process resident set size (RSS) during the load.
         ///

@@ -31,6 +31,7 @@ flate2 = "1" # gzip decoding; input compression is detected by content, not file
 bytes = "1" # The buffer type tokio-postgres's COPY sink accepts.
 futures-util = { version = "0.3", default-features = false, features = ["sink"] } # SinkExt::send, for feeding the COPY sink.
 uuid = { version = "1.24", features = ["v7"] } # Client-side UUIDv7 for the copy loader, the third id-generation site (D12).
+indicatif = "0.17" # Progress bars, replacing fhirbase's vbauerster/mpb.
 
 [lints.rust]
 unsafe_code = "forbid"

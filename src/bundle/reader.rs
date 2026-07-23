@@ -323,8 +323,15 @@ fn kind_of(value: &Value) -> &'static str {
 pub struct MultiFileReader {
     paths: std::vec::IntoIter<PathBuf>,
     current: Option<FileReader>,
-    skipped: Vec<(PathBuf, String)>,
+    /// Shared so a caller can still read it after the iterator has been moved
+    /// into an adapter or consumed. Skipped files belong in the end-of-run
+    /// summary (spec §8.4), and the summary is printed by whoever *drove* the
+    /// iterator, not by the iterator itself.
+    skipped: SkippedFiles,
 }
+
+/// Files that could not be read, with the reason for each.
+pub type SkippedFiles = std::rc::Rc<std::cell::RefCell<Vec<(PathBuf, String)>>>;
 
 impl MultiFileReader {
     /// Prepares to read the given files, in order.
@@ -333,14 +340,16 @@ impl MultiFileReader {
         Self {
             paths: paths.into_iter(),
             current: None,
-            skipped: Vec::new(),
+            skipped: SkippedFiles::default(),
         }
     }
 
-    /// The files that could not be read, with the reason for each.
+    /// A handle to the list of files that could not be read.
+    ///
+    /// Take this before consuming the iterator; it stays readable afterwards.
     #[must_use]
-    pub fn skipped(&self) -> &[(PathBuf, String)] {
-        &self.skipped
+    pub fn skipped(&self) -> SkippedFiles {
+        std::rc::Rc::clone(&self.skipped)
     }
 }
 
@@ -363,7 +372,7 @@ impl Iterator for MultiFileReader {
                     // Report and continue: one unreadable file in a directory
                     // of a thousand must not abort the load.
                     eprintln!("skipping {}: {e}", path.display());
-                    self.skipped.push((path, e.to_string()));
+                    self.skipped.borrow_mut().push((path, e.to_string()));
                 }
             }
         }
@@ -594,23 +603,27 @@ mod tests {
     fn an_unreadable_file_is_skipped_and_recorded() {
         let good = scratch("skip_good.json", br#"{"resourceType":"Patient","id":"g"}"#);
         let missing = PathBuf::from("/no/such/file.json");
-        let mut reader = MultiFileReader::new(vec![missing.clone(), good]);
-        let got: Vec<Value> = reader.by_ref().map(|r| r.unwrap()).collect();
+        let reader = MultiFileReader::new(vec![missing.clone(), good]);
+        let skipped = reader.skipped();
+        let got: Vec<Value> = reader.map(|r| r.unwrap()).collect();
 
         assert_eq!(got.len(), 1, "the good file must still be read");
         assert_eq!(got[0]["id"], "g");
-        assert_eq!(reader.skipped().len(), 1);
-        assert_eq!(reader.skipped()[0].0, missing);
+        // Readable after the iterator has been consumed, which is when the
+        // summary needs it.
+        assert_eq!(skipped.borrow().len(), 1);
+        assert_eq!(skipped.borrow()[0].0, missing);
     }
 
     #[test]
     fn an_undetectable_file_is_skipped_too() {
         let bad = scratch("skip_bad.json", b"not json at all");
         let good = scratch("skip_good2.json", br#"{"resourceType":"Patient","id":"g"}"#);
-        let mut reader = MultiFileReader::new(vec![bad, good]);
-        let got: Vec<Value> = reader.by_ref().map(|r| r.unwrap()).collect();
+        let reader = MultiFileReader::new(vec![bad, good]);
+        let skipped = reader.skipped();
+        let got: Vec<Value> = reader.map(|r| r.unwrap()).collect();
         assert_eq!(got.len(), 1);
-        assert_eq!(reader.skipped().len(), 1);
+        assert_eq!(skipped.borrow().len(), 1);
     }
 
     #[test]

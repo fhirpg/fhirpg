@@ -173,25 +173,22 @@ impl CopyRun {
             return Ok(());
         }
         let chunk = self.buffer.split().freeze();
-        self.sink.send(chunk).await.map_err(|e| {
-            Error::Db(format!(
-                "cannot stream rows into \"{}\": {}",
-                self.table,
-                describe(&e)
-            ))
-        })
+        let table = self.table;
+        self.sink
+            .send(chunk)
+            .await
+            .map_err(|e| copy_error(table, &e))
     }
 
     /// Flushes and closes the `COPY`.
     async fn finish(mut self) -> Result<()> {
         self.send_buffer().await?;
-        self.sink.as_mut().finish().await.map_err(|e| {
-            Error::Db(format!(
-                "cannot finish COPY into \"{}\": {}",
-                self.table,
-                describe(&e)
-            ))
-        })?;
+        let table = self.table;
+        self.sink
+            .as_mut()
+            .finish()
+            .await
+            .map_err(|e| copy_error(table, &e))?;
         Ok(())
     }
 }
@@ -212,6 +209,31 @@ fn append_escaped(out: &mut BytesMut, value: &str) {
             other => out.extend_from_slice(&[other]),
         }
     }
+}
+
+/// Turns a `COPY` failure into an error, explaining the common one.
+///
+/// A unique violation here means the input carries an id already in the table,
+/// or repeats one within itself. `COPY` has no `ON CONFLICT` clause, so it
+/// cannot skip the row the way the insert loader does — that asymmetry is the
+/// reason fhirbase recommends insert mode "when you have duplicate IDs in your
+/// source files" (`main.go:216-221`). The message says so, because the raw
+/// constraint error does not.
+fn copy_error(table: &str, error: &tokio_postgres::Error) -> Error {
+    let is_duplicate = error
+        .code()
+        .is_some_and(|code| *code == tokio_postgres::error::SqlState::UNIQUE_VIOLATION);
+
+    let mut message = format!("COPY into \"{table}\" failed: {}", describe(error));
+    if is_duplicate {
+        message.push_str(
+            "\n\nCopy mode cannot skip duplicate ids: COPY has no ON CONFLICT clause. \
+             This usually means the data is already loaded, or the input repeats an id. \
+             Re-run with `--mode insert`, which keeps the first occurrence and ignores \
+             the rest.",
+        );
+    }
+    Error::Db(message)
 }
 
 /// Renders a database error with its source chain.

@@ -27,6 +27,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] } # 
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] } # PostgreSQL driver (D2); exposes COPY FROM STDIN, which the copy loader needs. The feature maps jsonb to serde_json::Value.
 native-tls = "0.2" # TLS backend. Chosen over rustls because its two danger switches map exactly onto libpq's four TLS sslmodes (spec §6).
 postgres-native-tls = "0.5" # Bridges native-tls to tokio-postgres.
+flate2 = "1" # gzip decoding; input compression is detected by content, not filename (spec §5.1).
 
 [lints.rust]
 unsafe_code = "forbid"

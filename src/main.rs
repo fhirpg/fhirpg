@@ -24,6 +24,11 @@
     expect(dead_code, reason = "schema accessors are consumed by tasks T11-T15")
 )]
 mod assets;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the bundle readers in task T13")
+)]
+mod bundle;
 mod cli;
 mod commands;
 mod config;

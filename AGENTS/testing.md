@@ -14,6 +14,22 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 A change that reduces the passing count is a regression. CI enforces the same
 four, plus the MSRV (1.88) and the database suite.
 
+## Panicking in tests
+
+`unwrap_used`, `expect_used`, and `panic` are denied crate-wide (spec invariant
+2). Test code is exempt, because panicking is how a test reports — but the
+exemption has to be applied in two different ways:
+
+- **Unit tests** inside `src/` are covered by the `#![cfg_attr(test, allow(…))]`
+  at the top of `src/main.rs`. Nothing to do.
+- **Integration tests** in `tests/` are separate crates compiled as normal
+  binaries, so `cfg(test)` is false there and the crate attribute does not
+  reach them. Each file needs its own header:
+
+  ```rust
+  #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
+  ```
+
 ## Hermetic by default
 
 `cargo test` must pass on a machine with no PostgreSQL, no network, and no

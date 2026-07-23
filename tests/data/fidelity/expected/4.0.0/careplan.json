@@ -1,0 +1,29 @@
+{
+    "careTeam": [
+        {
+            "display": "John",
+            "id": "1",
+            "resourceType": "Practitioner"
+        },
+        {
+            "id": "2",
+            "resourceType": "Practitioner"
+        }
+    ],
+    "identifier": [
+        {
+            "system": "foo",
+            "value": "bar"
+        },
+        {
+            "assigner": {
+                "display": "JD",
+                "id": "42",
+                "resourceType": "Practitioner"
+            },
+            "system": "foo",
+            "value": "baz"
+        }
+    ],
+    "resourceType": "CarePlan"
+}

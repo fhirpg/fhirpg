@@ -1,0 +1,21 @@
+{
+    "performed": {
+        "Period": {
+            "start": "2020-01-01"
+        }
+    },
+    "performer": [
+        {
+            "actor": {
+                "id": "1",
+                "resourceType": "Practitioner"
+            }
+        }
+    ],
+    "resourceType": "Procedure",
+    "status": "completed",
+    "subject": {
+        "id": "1",
+        "resourceType": "Patient"
+    }
+}

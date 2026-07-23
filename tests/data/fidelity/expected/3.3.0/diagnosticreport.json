@@ -1,0 +1,21 @@
+{
+    "effective": {
+        "dateTime": "2020-01-01"
+    },
+    "resourceType": "DiagnosticReport",
+    "result": [
+        {
+            "id": "1",
+            "resourceType": "Observation"
+        },
+        {
+            "id": "2",
+            "resourceType": "Observation"
+        }
+    ],
+    "status": "final",
+    "subject": {
+        "id": "1",
+        "resourceType": "Patient"
+    }
+}

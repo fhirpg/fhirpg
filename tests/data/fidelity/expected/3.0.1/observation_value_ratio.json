@@ -1,0 +1,14 @@
+{
+    "resourceType": "Observation",
+    "status": "final",
+    "value": {
+        "Ratio": {
+            "denominator": {
+                "value": 2
+            },
+            "numerator": {
+                "value": 1
+            }
+        }
+    }
+}

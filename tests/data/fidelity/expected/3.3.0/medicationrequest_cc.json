@@ -1,0 +1,13 @@
+{
+    "medication": {
+        "CodeableConcept": {
+            "text": "aspirin"
+        }
+    },
+    "resourceType": "MedicationRequest",
+    "status": "active",
+    "subject": {
+        "id": "1",
+        "resourceType": "Patient"
+    }
+}

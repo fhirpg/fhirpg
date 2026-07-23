@@ -1,0 +1,10 @@
+{
+    "generalPractitioner": [
+        [
+            {
+                "reference": "Practitioner/a"
+            }
+        ]
+    ],
+    "resourceType": "Patient"
+}

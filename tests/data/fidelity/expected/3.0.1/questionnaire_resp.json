@@ -1,0 +1,33 @@
+{
+    "item": [
+        {
+            "answer": [
+                {
+                    "value": {
+                        "string": "s"
+                    }
+                },
+                {
+                    "value": {
+                        "integer": 4
+                    }
+                },
+                {
+                    "value": {
+                        "Reference": {
+                            "id": "2",
+                            "resourceType": "Patient"
+                        }
+                    }
+                }
+            ],
+            "linkId": "1"
+        }
+    ],
+    "resourceType": "QuestionnaireResponse",
+    "status": "completed",
+    "subject": {
+        "id": "1",
+        "resourceType": "Patient"
+    }
+}

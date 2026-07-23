@@ -1,0 +1,12 @@
+{
+    "name": [
+        {
+            "family": "\u00dcn\u00efc\u00f8d\u00e9 \"quoted\" \\ back",
+            "given": [
+                "\u65e5\u672c\u8a9e",
+                "emoji \ud83d\udd25"
+            ]
+        }
+    ],
+    "resourceType": "Patient"
+}

@@ -1,0 +1,1 @@
+{"resourceType": "DiagnosticReport", "status": "final", "subject": {"reference": "Patient/1"}, "effectiveDateTime": "2020-01-01", "result": [{"reference": "Observation/1"}, {"reference": "Observation/2"}]}

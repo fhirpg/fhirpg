@@ -1,0 +1,1 @@
+{"resourceType": "AllergyIntolerance", "patient": {"reference": "Patient/1"}, "onsetAge": {"value": 5, "unit": "a"}, "reaction": [{"substance": {"text": "x"}}]}

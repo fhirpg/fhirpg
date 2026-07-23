@@ -1,0 +1,11 @@
+{
+    "generalPractitioner": [
+        [
+            {
+                "id": "a",
+                "resourceType": "Practitioner"
+            }
+        ]
+    ],
+    "resourceType": "Patient"
+}

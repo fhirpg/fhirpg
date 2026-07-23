@@ -101,7 +101,6 @@ pub enum Error {
     },
 }
 
-#[expect(dead_code, reason = "constructors are used by tasks T12-T16, not yet written")]
 impl Error {
     /// Builds an [`Error::Bundle`] without ceremony at the call site.
     pub fn bundle(source_name: impl Into<String>, message: impl Into<String>) -> Self {

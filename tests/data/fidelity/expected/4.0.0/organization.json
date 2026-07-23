@@ -1,0 +1,14 @@
+{
+    "identifier": [
+        {
+            "system": "s",
+            "value": "v"
+        }
+    ],
+    "name": "ACME",
+    "partOf": {
+        "id": "parent",
+        "resourceType": "Organization"
+    },
+    "resourceType": "Organization"
+}

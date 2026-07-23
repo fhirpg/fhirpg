@@ -16,19 +16,24 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
-// The module's own tests exercise everything in it, so the expectation applies
-// only to the non-test build, where the transformation that consumes it (task
-// T6) does not exist yet.
+// Schema statements and the version list are read by `init` (T11) and the
+// loaders (T14, T15); only the transform map is consumed so far. The module's
+// own tests cover the rest, so the expectation is non-test only.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the transformation in task T6")
+    expect(dead_code, reason = "schema accessors are consumed by tasks T11-T15")
 )]
 mod assets;
 mod cli;
+mod commands;
 mod error;
+mod transform;
+
+use std::str::FromStr;
 
 use clap::{CommandFactory, Parser};
 
+use crate::assets::FhirVersion;
 use crate::cli::{Cli, Command};
 use crate::error::Error;
 
@@ -56,15 +61,16 @@ fn run(cli: &Cli) -> error::Result<()> {
         return Ok(());
     };
 
+    // Parsed once, here, so an unknown `--fhir` fails before any command does
+    // work — and fails the same way for every command (spec §3).
+    let version = FhirVersion::from_str(&cli.fhir)?;
+
     match command {
         Command::Init => Err(Error::NotImplemented {
             command: "init",
             task: "T11",
         }),
-        Command::Transform { .. } => Err(Error::NotImplemented {
-            command: "transform",
-            task: "T7",
-        }),
+        Command::Transform { file } => commands::transform::run(file, version),
         Command::Load { .. } => Err(Error::NotImplemented {
             command: "load",
             task: "T16",

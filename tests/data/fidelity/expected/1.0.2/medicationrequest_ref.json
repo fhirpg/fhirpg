@@ -1,0 +1,10 @@
+{
+    "medicationReference": {
+        "reference": "Medication/1"
+    },
+    "resourceType": "MedicationRequest",
+    "status": "active",
+    "subject": {
+        "reference": "Patient/1"
+    }
+}

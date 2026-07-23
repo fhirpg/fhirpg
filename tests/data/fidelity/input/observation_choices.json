@@ -1,0 +1,1 @@
+{"resourceType": "Observation", "status": "final", "valueQuantity": {"value": 9.5, "unit": "mg"}, "effectiveDateTime": "2020-01-01T00:00:00Z", "subject": {"reference": "Patient/1"}, "performer": [{"reference": "Practitioner/1"}, {"reference": "Organization/2"}], "component": [{"valueString": "abc"}, {"valueBoolean": false}]}

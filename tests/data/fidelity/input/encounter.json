@@ -1,0 +1,1 @@
+{"resourceType": "Encounter", "status": "finished", "subject": {"reference": "Patient/1"}, "participant": [{"individual": {"reference": "Practitioner/7", "display": "Dr"}}], "period": {"start": "2020-01-01"}, "diagnosis": [{"condition": {"reference": "Condition/5"}}]}

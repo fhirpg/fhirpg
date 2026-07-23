@@ -1,0 +1,1 @@
+{"resourceType": "Patient", "managingOrganization": {"reference": "Organization/1", "display": "A", "type": "Organization", "identifier": {"system": "s", "value": "v"}, "extension": [{"url": "u", "valueString": "x"}]}}

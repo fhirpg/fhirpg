@@ -1,0 +1,21 @@
+{
+    "abatementBoolean": true,
+    "evidence": [
+        {
+            "detail": [
+                {
+                    "id": "1",
+                    "resourceType": "Observation"
+                }
+            ]
+        }
+    ],
+    "onset": {
+        "dateTime": "2019-01-01"
+    },
+    "resourceType": "Condition",
+    "subject": {
+        "id": "1",
+        "resourceType": "Patient"
+    }
+}

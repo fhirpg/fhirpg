@@ -1,0 +1,18 @@
+{
+    "onsetAge": {
+        "unit": "a",
+        "value": 5
+    },
+    "patient": {
+        "id": "1",
+        "resourceType": "Patient"
+    },
+    "reaction": [
+        {
+            "substance": {
+                "text": "x"
+            }
+        }
+    ],
+    "resourceType": "AllergyIntolerance"
+}

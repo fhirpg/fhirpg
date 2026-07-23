@@ -1,0 +1,37 @@
+{
+    "component": [
+        {
+            "value": {
+                "string": "abc"
+            }
+        },
+        {
+            "valueBoolean": false
+        }
+    ],
+    "effective": {
+        "dateTime": "2020-01-01T00:00:00Z"
+    },
+    "performer": [
+        {
+            "id": "1",
+            "resourceType": "Practitioner"
+        },
+        {
+            "id": "2",
+            "resourceType": "Organization"
+        }
+    ],
+    "resourceType": "Observation",
+    "status": "final",
+    "subject": {
+        "id": "1",
+        "resourceType": "Patient"
+    },
+    "value": {
+        "Quantity": {
+            "unit": "mg",
+            "value": 9.5
+        }
+    }
+}

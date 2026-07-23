@@ -1,0 +1,20 @@
+{
+    "effective": {
+        "Period": {
+            "end": "2020-02-01",
+            "start": "2020-01-01"
+        }
+    },
+    "resourceType": "Observation",
+    "status": "final",
+    "value": {
+        "CodeableConcept": {
+            "coding": [
+                {
+                    "code": "x",
+                    "system": "http://loinc.org"
+                }
+            ]
+        }
+    }
+}

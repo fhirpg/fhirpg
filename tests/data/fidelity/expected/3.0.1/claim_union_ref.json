@@ -1,0 +1,13 @@
+{
+    "information": [
+        {
+            "value": {
+                "Reference": {
+                    "id": "123",
+                    "resourceType": "Immunization"
+                }
+            }
+        }
+    ],
+    "resourceType": "Claim"
+}

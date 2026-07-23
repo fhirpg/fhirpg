@@ -1,0 +1,26 @@
+{
+    "diagnosis": [
+        {
+            "condition": {
+                "reference": "Condition/5"
+            }
+        }
+    ],
+    "participant": [
+        {
+            "individual": {
+                "display": "Dr",
+                "id": "7",
+                "resourceType": "Practitioner"
+            }
+        }
+    ],
+    "period": {
+        "start": "2020-01-01"
+    },
+    "resourceType": "Encounter",
+    "status": "finished",
+    "subject": {
+        "reference": "Patient/1"
+    }
+}

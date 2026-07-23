@@ -1,0 +1,6 @@
+{
+    "multipleBirth": {
+        "boolean": false
+    },
+    "resourceType": "Patient"
+}

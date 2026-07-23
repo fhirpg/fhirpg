@@ -1,0 +1,10 @@
+{
+    "information": [
+        {
+            "valueReference": {
+                "reference": "Immunization/123"
+            }
+        }
+    ],
+    "resourceType": "Claim"
+}

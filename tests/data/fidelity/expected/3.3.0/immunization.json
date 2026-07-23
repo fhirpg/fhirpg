@@ -1,0 +1,9 @@
+{
+    "occurrenceDateTime": "2020-01-01",
+    "patient": {
+        "id": "1",
+        "resourceType": "Patient"
+    },
+    "resourceType": "Immunization",
+    "status": "completed"
+}

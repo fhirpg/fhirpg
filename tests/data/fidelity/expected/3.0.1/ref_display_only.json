@@ -1,0 +1,6 @@
+{
+    "managingOrganization": {
+        "display": "ACME"
+    },
+    "resourceType": "Patient"
+}

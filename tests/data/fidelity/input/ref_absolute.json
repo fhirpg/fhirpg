@@ -1,0 +1,1 @@
+{"resourceType": "Patient", "managingOrganization": {"reference": "http://ex.com/fhir/Organization/1"}}

@@ -611,8 +611,19 @@ than executed; loading `demo/bundle.ndjson.gzip` yields per-type counts matching
 - `GET /health` — 200 when a connection can be acquired and a trivial query
   runs.
 
-Requests are logged (method, URL, remote address, user agent) and the server
-shuts down gracefully on SIGINT.
+The server shuts down gracefully on SIGINT.
+
+The console's assets MUST contain no third-party tracking and MUST fetch nothing
+from a third party at runtime. fhirbase's console carries Google Analytics and
+Yandex Metrica — the latter with session recording — on a page that renders
+patient data, and reports every SQL statement the user runs as an analytics
+event (defect X17). Decision D1 removed telemetry from the binary; the UI MUST
+NOT reinstate it.
+
+Values MUST be rendered by the server, via `row_to_json`, not decoded per type
+in the client. The console runs arbitrary SQL, so a column may be of any type,
+including one an extension added; a client-side type table silently returns
+null for whatever it has not heard of.
 
 **Security.** `/q` executes arbitrary SQL with no authentication. That is the
 feature. fhirbase compounds it by defaulting `--webhost` to the empty string,
@@ -686,6 +697,6 @@ be built; [`../tasks.md`](../tasks.md) sequences the work; each task names the
 sections it satisfies.
 
 Divergences from fhirbase are deliberate and enumerated in
-[`../plan.md`](../plan.md): sixteen defect fixes (X1–X16) and fourteen decisions
+[`../plan.md`](../plan.md): seventeen defect fixes (X1–X17) and fourteen decisions
 (D1–D14). Nothing else in the observable behaviour may differ without a spec
 change landing first.

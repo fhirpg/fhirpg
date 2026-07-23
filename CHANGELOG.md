@@ -44,6 +44,6 @@ Deliberate divergences from fhirbase, decided during planning:
 - Generates ids as **UUIDv7** rather than v4, at all three generation sites (D12).
 - Takes the history pre-image from `RETURNING OLD` rather than a sibling CTE (D13).
 - `--memusage` reports operating-system RSS, not Go GC statistics (D14).
-- Fixes sixteen catalogued defects in the Go original (X1-X16 in `plan.md`),
+- Fixes seventeen catalogued defects in the Go original (X1-X17 in `plan.md`),
   including an SQL injection vector and an inability to load FHIR `Group`
   resources at all.

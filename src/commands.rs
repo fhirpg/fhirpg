@@ -6,9 +6,10 @@
 //! `AGENTS/architecture.md`).
 //!
 //! Modules appear as their tasks land: `transform` (T7), `init` (T11),
-//! `load` (T16), `bulkget` (T18), then `web` (T20).
+//! `load` (T16), `bulkget` (T18), and `web` (T20).
 
 pub mod bulkget;
 pub mod init;
 pub mod load;
 pub mod transform;
+pub mod web;

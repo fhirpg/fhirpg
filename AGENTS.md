@@ -14,7 +14,7 @@ procedures for CRUD.
 It is a **Rust translation of [fhirbase](https://github.com/fhirbase/fhirbase)**,
 a Go utility by Health Samurai that is no longer maintained. The Go source is
 the specification input, not a thing to copy blindly: the translation fixes
-sixteen catalogued defects and modernizes the target platform. See
+seventeen catalogued defects and modernizes the target platform. See
 [`plan.md`](plan.md).
 
 ## Repository shape
@@ -73,7 +73,7 @@ a comment saying why the panic is unreachable.
 - **Cite the Go source.** When porting a unit, name the fhirbase file and line
   range in the commit message. `~/github/fhirbase/fhirbase` is the reference
   checkout.
-- **Fix the catalogued defects, do not reproduce them.** X1-X16 in `plan.md`.
+- **Fix the catalogued defects, do not reproduce them.** X1-X17 in `plan.md`.
   Equally: two surprising behaviours are *intentional* and must be preserved —
   see `AGENTS/conventions.md`.
 - **Small, verifiable changes.** Anything with a runtime surface gets a test.
@@ -87,7 +87,7 @@ a comment saying why the panic is unreachable.
 | [`AGENTS/testing.md`](AGENTS/testing.md) | Test patterns, the green gate, database tests |
 | [`AGENTS/glossary.md`](AGENTS/glossary.md) | FHIR, fhirbase, and project terminology |
 | [`spec/index.md`](spec/index.md) | The living specifications |
-| [`plan.md`](plan.md) | Phases, decisions D1-D14, divergences X1-X16, risks |
+| [`plan.md`](plan.md) | Phases, decisions D1-D14, divergences X1-X17, risks |
 | [`tasks.md`](tasks.md) | Ordered tasks T1-T27 |
 
 ## House rules

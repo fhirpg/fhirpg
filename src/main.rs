@@ -115,10 +115,10 @@ fn run(cli: &Cli) -> error::Result<()> {
             };
             runtime()?.block_on(commands::bulkget::run(url, dir, &options))
         }
-        Command::Web { .. } => Err(Error::NotImplemented {
-            command: "web",
-            task: "T20",
-        }),
+        Command::Web { webport, webhost } => {
+            let config = PgConfig::from_args(&cli.connection);
+            runtime()?.block_on(commands::web::run(&config, webhost, *webport))
+        }
     }
 }
 
@@ -144,17 +144,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unimplemented_commands_name_their_task() {
-        // Repointed as tasks land: `init` (T11), then `bulkget` (T18). `web`
-        // is the last one; when T20 lands, delete this test along with
-        // `Error::NotImplemented`.
-        let cli = Cli::try_parse_from(["fhirpg", "web"]).unwrap_or_else(|e| panic!("{e}"));
-        let message = match run(&cli) {
-            Err(e) => e.to_string(),
-            Ok(()) => panic!("web is not implemented yet"),
-        };
-        assert!(message.contains("web"), "{message}");
-        assert!(message.contains("T20"), "{message}");
-    }
 }

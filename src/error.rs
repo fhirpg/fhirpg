@@ -82,17 +82,6 @@ pub enum Error {
     /// An I/O failure not attributable to a specific input file.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-
-    /// A command exists but is not implemented yet.
-    ///
-    /// Present only while the port is in progress; removed at 1.0.
-    #[error("`{command}` is not implemented yet (see tasks.md: {task})")]
-    NotImplemented {
-        /// The subcommand name.
-        command: &'static str,
-        /// The task that will implement it, e.g. `"T11"`.
-        task: &'static str,
-    },
 }
 
 impl Error {

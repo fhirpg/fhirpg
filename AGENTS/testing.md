@@ -79,7 +79,7 @@ tested against `wiremock`, not against a live server.
 
 ## Defect regression tests
 
-Each catalogued fhirbase defect (X1-X16 in `plan.md`) gets a test that would
+Each catalogued fhirbase defect (X1-X17 in `plan.md`) gets a test that would
 fail against the Go behaviour. These are the most valuable tests in the suite,
 because they are the reasons the port exists. The sharpest one: loading a FHIR
 `Group` resource, which fhirbase's default insert mode cannot do at all.

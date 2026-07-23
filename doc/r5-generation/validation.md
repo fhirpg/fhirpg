@@ -108,12 +108,46 @@ Applying the same rules to the 5.0.0 spec yields 175 top-level entries:
 The growth is consistent with R5's larger resource set and its wider use of
 `CodeableReference`.
 
+## Verifying what the oracle cannot reach (T22)
+
+Reproducing R3 and R4 says nothing about constructs those releases do not have.
+The most important is **`CodeableReference`**, which R5 introduced and uses
+widely: it pairs a `CodeableConcept` with a `Reference`, so the reference must
+split while the concept passes through.
+
+`verify_r5.py` re-derives what the map should contain **from the specification,
+by a different route than the generator** — walking the snapshots and asking,
+per element, whether it is a choice and which suffixes should exist, or whether
+it is a `Reference` and what action and cardinality should appear. It also
+checks nothing was invented: every union names a type the spec allows, and every
+reference action corresponds to a real `Reference` element.
+
+Coverage: the ten resource types tasks.md names — `Patient`, `Observation`,
+`Bundle`, `Group`, `MedicationRequest`, `Encounter`, `Questionnaire`,
+`Subscription`, `Evidence`, `ImplementationGuide` — plus the six datatypes R5
+added.
+
+**266 checks, all passing.** The datatypes came out as they should:
+
+| Datatype | In the map | Correct because |
+| --- | --- | --- |
+| `CodeableReference` | yes | carries a `Reference` |
+| `ExtendedContactDetail` | yes | carries an `organization` reference |
+| `VirtualServiceDetail` | yes | carries a choice element |
+| `Availability` | no | no references, no choices |
+| `RatioRange` | no | all `Quantity`, no rules |
+| `MonetaryComponent` | no | no references, no choices |
+
+Three unit tests pin the behaviour so it cannot regress: `CodeableReference`
+splitting through a nested backbone, R5 handling the shapes R4 also has, and a
+resource R5 added (`Transport`) passing through an R4 map untouched while the R5
+map rewrites it.
+
 ## Status
 
-`gen_transform_prototype.py` is the prototype that established the rules. It is
-kept as the reference for the Rust `xtask`, and as the thing to re-run if the
-Rust port's output ever needs explaining.
+Done: the Rust `xtask`, the schema-DDL generator, the R5 assets, the
+verification above, and the default flip to 5.0.0.
 
-**Still to do:** the Rust `xtask` port, the schema-DDL generator, the
-hand-verification of ten resource types (T22), and flipping the default to
-5.0.0 (T23).
+`gen_transform_prototype.py` is kept as the prototype that established the
+rules, and as the thing to re-run if the Rust port's output ever needs
+explaining. `xtask validate` keeps the R3/R4 comparison runnable.

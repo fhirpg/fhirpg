@@ -537,6 +537,85 @@ mod tests {
     }
 
     #[test]
+    fn r5_codeable_reference_splits_its_nested_reference() {
+        // `CodeableReference` is R5's most consequential new datatype and the
+        // one the R3/R4 oracle cannot exercise (task T22). It pairs a
+        // CodeableConcept with a Reference, so the reference must split while
+        // the concept passes through — here reached through a repeating
+        // BackboneElement, a repeating CodeableReference, and then the
+        // Reference itself.
+        let map = FhirVersion::V5_0_0.transform_map().unwrap();
+        let input = json!({
+            "resourceType": "Encounter",
+            "id": "e1",
+            "reason": [{"value": [{
+                "concept": {"text": "chest pain"},
+                "reference": {"reference": "Condition/c1"}
+            }]}]
+        });
+        let out = transform_resource(&input, map).unwrap();
+        let value = &out["reason"][0]["value"][0];
+
+        assert_eq!(value["concept"], json!({"text": "chest pain"}));
+        assert_eq!(
+            value["reference"],
+            json!({"id": "c1", "resourceType": "Condition"})
+        );
+    }
+
+    #[test]
+    fn r5_transforms_the_shapes_r4_also_has() {
+        // The generated R5 map must behave like the vendored ones on the
+        // constructs they share, or the generator has diverged in a way the
+        // oracle would not catch.
+        let map = FhirVersion::V5_0_0.transform_map().unwrap();
+        let out = transform_resource(
+            &json!({
+                "resourceType": "Patient",
+                "deceasedBoolean": true,
+                "managingOrganization": {"reference": "Organization/9"},
+                "generalPractitioner": [{"reference": "Practitioner/a"}]
+            }),
+            map,
+        )
+        .unwrap();
+
+        assert_eq!(out["deceased"], json!({"boolean": true}));
+        assert_eq!(
+            out["managingOrganization"],
+            json!({"id": "9", "resourceType": "Organization"})
+        );
+        assert_eq!(
+            out["generalPractitioner"],
+            json!([{"id": "a", "resourceType": "Practitioner"}])
+        );
+    }
+
+    #[test]
+    fn a_resource_r5_added_is_known_only_to_r5() {
+        // Transport is new in R5; an R4 map must pass it through untouched
+        // while the R5 map rewrites its references.
+        let input = json!({
+            "resourceType": "Transport",
+            "id": "t1",
+            "requester": {"reference": "Practitioner/p"}
+        });
+
+        let r4 = FhirVersion::V4_0_0.transform_map().unwrap();
+        assert_eq!(
+            transform_resource(&input, r4).unwrap(),
+            input,
+            "an unknown resource type passes through (spec §4.2)"
+        );
+
+        let r5 = FhirVersion::V5_0_0.transform_map().unwrap();
+        assert_eq!(
+            transform_resource(&input, r5).unwrap()["requester"],
+            json!({"id": "p", "resourceType": "Practitioner"})
+        );
+    }
+
+    #[test]
     fn the_transformation_is_not_idempotent() {
         // Worth pinning, because it is a natural thing to assume and it is
         // false. `managingOrganization` keeps its `reference` rule, so a second

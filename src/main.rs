@@ -26,6 +26,18 @@
 mod assets;
 mod cli;
 mod commands;
+// Both modules' own tests exercise them; `init` (T11) is the first non-test
+// consumer.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the init command in task T11")
+)]
+mod config;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the init command in task T11")
+)]
+mod db;
 mod error;
 mod transform;
 

@@ -445,7 +445,7 @@ Defects referenced as `Xn` are the fhirbase divergences catalogued in
 - **Depends:** T20, T23
 
 ### T27. Release 1.0.0
-- **Do:** CHANGELOG covering the whole port and every divergence (X1–X11, D1–D10),
+- **Do:** CHANGELOG covering the whole port and every divergence (X1–X12, D1–D10),
   `CITATION.cff`, version bump, tag, `cargo publish --dry-run`, GitHub release
   with binaries for macOS/Linux (`update.go`'s self-updater is dropped, so
   installation is the release page or `cargo install`).

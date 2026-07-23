@@ -23,6 +23,10 @@ clap = { version = "4.5", features = ["derive", "env", "wrap_help"] } # Command-
 thiserror = "2.0" # Derive macro for the typed error enum in `src/error.rs`.
 anyhow = "1.0" # Boundary error type: `main` only, never in library code.
 serde_json = "1" # Parses the transform maps and carries resources through the load path as `Value`.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] } # Async runtime (decision D2); `signal` backs the web server's graceful shutdown.
+tokio-postgres = "0.7" # PostgreSQL driver (D2); exposes COPY FROM STDIN, which the copy loader needs.
+native-tls = "0.2" # TLS backend. Chosen over rustls because its two danger switches map exactly onto libpq's four TLS sslmodes (spec §6).
+postgres-native-tls = "0.5" # Bridges native-tls to tokio-postgres.
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -38,3 +42,4 @@ panic = "deny"
 [dev-dependencies]
 proptest = "1" # Property-based tests for the transformation (spec §4.8).
 sha2 = "0.10" # Verifies that the vendored fhirbase assets are byte-identical (assets/CHECKSUMS.txt).
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] } # #[tokio::test] for the database tests.

@@ -28,13 +28,6 @@ const BANNER: &str = r"
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Password(String);
 
-// The tests below exercise both methods, so the expectation applies only to the
-// non-test build, where the connection builder that will call them (task T9)
-// does not exist yet.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the connection builder in task T9")
-)]
 impl Password {
     /// Returns the password. Call this only when handing it to the driver.
     pub fn expose(&self) -> &str {

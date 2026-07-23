@@ -466,11 +466,24 @@ built-in default.
 | `allow` | Plaintext first, TLS fallback |
 | `prefer` | TLS first without certificate verification, plaintext fallback |
 | `require` | TLS required, certificate not verified |
-| `verify-ca` | TLS required, certificate chain verified |
+| `verify-ca` | TLS required, certificate chain verified, **hostname not checked** |
 | `verify-full` | TLS required, chain and hostname verified |
+
+`verify-ca` MUST NOT verify the hostname. That is what distinguishes it from
+`verify-full`, and fhirbase collapses the two into one branch that verifies both
+(defect X12), refusing connections libpq would accept.
+
+`allow` MUST try plaintext first and fall back to TLS; `prefer` MUST try TLS
+first and fall back to plaintext. The two differ only in order, and
+`tokio-postgres` implements `prefer` natively but has no `allow`, so `allow` is
+implemented as two sequential connection attempts.
 
 An unrecognized value MUST be a typed error. fhirbase calls `panic!`
 (`db.go:59`); invariant 2 forbids that.
+
+Before executing any statement, a command that connects MUST verify the server
+is PostgreSQL 18 or newer (§2.3) and refuse an older one with an actionable
+message.
 
 The connection banner MUST report the **actual** `sslmode` and MUST redact the
 password. fhirbase hardcodes `sslmode=disable` into the banner regardless of the
@@ -658,6 +671,6 @@ be built; [`../tasks.md`](../tasks.md) sequences the work; each task names the
 sections it satisfies.
 
 Divergences from fhirbase are deliberate and enumerated in
-[`../plan.md`](../plan.md): eleven defect fixes (X1–X11) and fourteen decisions
+[`../plan.md`](../plan.md): twelve defect fixes (X1–X12) and fourteen decisions
 (D1–D14). Nothing else in the observable behaviour may differ without a spec
 change landing first.

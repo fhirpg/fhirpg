@@ -29,6 +29,11 @@ jobs:
       # Must pass with no database, no network, no container runtime.
       - run: cargo test
       - run: cargo test --doc
+      # Spec §4.8 asks for 10,000 property-test cases. The local edit-test loop
+      # runs proptest's default so it stays fast; CI pays the real cost.
+      - run: cargo test property_tests
+        env:
+          PROPTEST_CASES: 10000
 
   clippy:
     name: Clippy

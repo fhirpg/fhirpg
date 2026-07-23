@@ -68,7 +68,14 @@ tested against `wiremock`, not against a live server.
   significant (spec invariant 4).
 - **Property tests** (`proptest`) cover the invariants that no example can:
   unknown `resourceType` is the identity, no input panics, output is always
-  valid JSON.
+  valid JSON. The case count comes from proptest's default locally and from
+  `PROPTEST_CASES=10000` in CI, so the edit-test loop stays fast.
+
+  When a property fails, **check the implementation against fhirbase before
+  changing either.** The first failure found here was a wrong *property*, not a
+  wrong implementation: it assumed a `union` always yields an object, when a
+  union over an array yields an array of wrapped elements. The oracle settled
+  it in one command.
 
 ## Defect regression tests
 

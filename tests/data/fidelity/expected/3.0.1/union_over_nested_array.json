@@ -1,0 +1,10 @@
+{
+    "deceased": [
+        [
+            {
+                "boolean": true
+            }
+        ]
+    ],
+    "resourceType": "Patient"
+}

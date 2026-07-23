@@ -514,4 +514,242 @@ mod tests {
             json!({"a": {"b": {"c": [1, 2, {"d": "e"}]}}})
         );
     }
+
+    #[test]
+    fn union_over_an_array_wraps_each_element() {
+        // Found by proptest, which shrank to `[]`; the expected values below
+        // were then taken from fhirbase itself, not from reasoning. Spec §4.3:
+        // the action applies only to a non-array, so an array falls through to
+        // the array branch and each element is wrapped — while the rename to
+        // `deceased` still happens, because that comes from the parent.
+        assert_eq!(
+            t(json!({"resourceType": "Patient", "deceasedBoolean": []}))["deceased"],
+            json!([])
+        );
+        assert_eq!(
+            t(json!({"resourceType": "Patient", "deceasedBoolean": [true, false]}))["deceased"],
+            json!([{"boolean": true}, {"boolean": false}])
+        );
+        assert_eq!(
+            t(json!({"resourceType": "Patient", "deceasedBoolean": [[true]]}))["deceased"],
+            json!([[{"boolean": true}]])
+        );
+    }
+
+    #[test]
+    fn the_transformation_is_not_idempotent() {
+        // Worth pinning, because it is a natural thing to assume and it is
+        // false. `managingOrganization` keeps its `reference` rule, so a second
+        // pass re-applies the split to an already-split value: there is no
+        // `reference` field left, so `id` and `resourceType` are dropped.
+        //
+        // This is inherent to fhirbase's design — the map describes input
+        // shape, not output shape — so it is a property of the storage model,
+        // not a defect. It matters operationally: never re-transform a resource
+        // read back out of the database.
+        let map = FhirVersion::V3_0_1.transform_map().unwrap();
+        let once = transform_resource(
+            &json!({
+                "resourceType": "Patient",
+                "managingOrganization": {"reference": "Organization/1", "display": "ACME"}
+            }),
+            map,
+        )
+        .unwrap();
+        assert_eq!(
+            once["managingOrganization"],
+            json!({"id": "1", "resourceType": "Organization", "display": "ACME"})
+        );
+
+        let twice = transform_resource(&once, map).unwrap();
+        assert_eq!(
+            twice["managingOrganization"],
+            json!({"display": "ACME"}),
+            "a second pass drops id and resourceType"
+        );
+    }
+}
+
+/// Property-based tests for spec §4.8.
+///
+/// The example tests above prove the algorithm agrees with fhirbase on cases we
+/// thought of. These cover the cases we did not: arbitrary, hostile, deeply
+/// nested JSON that no FHIR server would ever emit.
+///
+/// The case count defaults to proptest's own and is raised in CI through
+/// `PROPTEST_CASES`, so the local edit-test loop stays fast while CI runs the
+/// 10,000 cases spec §4.8 asks for.
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use crate::assets::FhirVersion;
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    /// Arbitrary JSON: nulls, bools, numbers, strings, arrays, objects, nested.
+    fn arb_json() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            any::<i64>().prop_map(|i| Value::Number(i.into())),
+            // Include the characters that break naive string handling.
+            "[a-zA-Z0-9 /\"\\\\#:.-]{0,12}".prop_map(Value::String),
+        ];
+        leaf.prop_recursive(4, 48, 4, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                prop::collection::btree_map("[a-zA-Z][a-zA-Z0-9]{0,6}", inner, 0..4)
+                    .prop_map(|m| Value::Object(m.into_iter().collect())),
+            ]
+        })
+    }
+
+    /// An arbitrary JSON object, for use as a resource body.
+    fn arb_object() -> impl Strategy<Value = serde_json::Map<String, Value>> {
+        prop::collection::btree_map("[a-zA-Z][a-zA-Z0-9]{0,6}", arb_json(), 0..6)
+            .prop_map(|m| m.into_iter().collect())
+    }
+
+    fn map_v4() -> &'static TransformMap {
+        FhirVersion::V4_0_0.transform_map().unwrap()
+    }
+
+    /// Asserts that `node` is `original` with every non-array leaf wrapped as
+    /// `{"boolean": leaf}`, recursing through arrays.
+    ///
+    /// `Result` is fully qualified because the bare name resolves to the
+    /// crate's single-parameter alias, pulled in by `use super::*`.
+    fn assert_wrapped(
+        node: &Value,
+        original: &Value,
+    ) -> std::result::Result<(), TestCaseError> {
+        match (node, original) {
+            (Value::Array(got), Value::Array(want)) => {
+                prop_assert_eq!(got.len(), want.len());
+                for (g, w) in got.iter().zip(want) {
+                    assert_wrapped(g, w)?;
+                }
+                Ok(())
+            }
+            (node, original) => {
+                let object = node.as_object();
+                prop_assert!(object.is_some(), "expected a wrapper object, got {}", node);
+                let object = object.unwrap();
+                prop_assert_eq!(object.len(), 1);
+                // `boolean` is a primitive with no map entry, so the value
+                // passes through untouched however hostile it is.
+                prop_assert_eq!(&object["boolean"], original);
+                Ok(())
+            }
+        }
+    }
+
+    proptest! {
+        /// Spec §4.2 step 2. This is the property that lets data from a newer
+        /// FHIR version survive an older map unchanged.
+        #[test]
+        fn unknown_resource_type_is_the_identity(mut body in arb_object()) {
+            body.insert(
+                "resourceType".to_owned(),
+                json!("NoSuchResourceTypeExistsAnywhere"),
+            );
+            let input = Value::Object(body);
+            prop_assert_eq!(transform_resource(&input, map_v4()).unwrap(), input);
+        }
+
+        /// Spec invariant 2. Any panic anywhere in the algorithm fails here.
+        #[test]
+        fn arbitrary_input_never_panics(mut body in arb_object()) {
+            for resource_type in ["Patient", "Observation", "Bundle", "Group", "Claim"] {
+                body.insert("resourceType".to_owned(), json!(resource_type));
+                let input = Value::Object(body.clone());
+                // Must return, not unwind, whatever the body looks like.
+                let out = transform_resource(&input, map_v4());
+                prop_assert!(out.is_ok());
+                prop_assert!(out.unwrap().is_object());
+            }
+        }
+
+        /// A malformed value where a Reference belongs must not panic — this is
+        /// the exact site of fhirbase's unchecked type assertion.
+        #[test]
+        fn arbitrary_reference_position_never_panics(value in arb_json()) {
+            let input = json!({
+                "resourceType": "Patient",
+                "managingOrganization": value,
+            });
+            prop_assert!(transform_resource(&input, map_v4()).is_ok());
+        }
+
+        /// Spec §4.5: the reference rewrite emits nothing but these three keys.
+        #[test]
+        fn reference_output_has_only_the_three_allowed_keys(body in arb_object()) {
+            let input = json!({
+                "resourceType": "Patient",
+                "managingOrganization": Value::Object(body),
+            });
+            let out = transform_resource(&input, map_v4()).unwrap();
+            let org = out["managingOrganization"].as_object().unwrap();
+            for key in org.keys() {
+                prop_assert!(
+                    matches!(key.as_str(), "id" | "resourceType" | "display"),
+                    "reference rewrite emitted an unexpected key: {}",
+                    key
+                );
+            }
+        }
+
+        /// Spec §4.4 and §4.3: a union wraps a non-array value in a single-key
+        /// object tagged by the declared type. An **array** value falls through
+        /// to the array branch instead and each element is wrapped, so the
+        /// result is an array — the rename to `deceased` still happens either
+        /// way.
+        ///
+        /// The array half of this property was discovered by proptest, which
+        /// shrank to `[]` against an earlier version of this test that assumed
+        /// the output was always an object. The behaviour was then confirmed
+        /// against fhirbase itself, and the three shapes are pinned in
+        /// `union_over_an_array_wraps_each_element` and in the fidelity corpus.
+        #[test]
+        fn union_output_is_wrapped_by_declared_type(value in arb_json()) {
+            let input = json!({
+                "resourceType": "Patient",
+                "deceasedBoolean": value.clone(),
+            });
+            let out = transform_resource(&input, map_v4()).unwrap();
+            assert_wrapped(&out["deceased"], &value)?;
+        }
+
+        /// `resourceType` and `id` are never rewritten by any of the nine maps
+        /// — verified across every asset before this was asserted — so they
+        /// must survive transformation intact.
+        #[test]
+        fn resource_type_and_id_survive(mut body in arb_object(), id in "[a-zA-Z0-9-]{1,12}") {
+            body.insert("resourceType".to_owned(), json!("Patient"));
+            body.insert("id".to_owned(), json!(id.clone()));
+            let out = transform_resource(&Value::Object(body), map_v4()).unwrap();
+            prop_assert_eq!(&out["resourceType"], &json!("Patient"));
+            prop_assert_eq!(&out["id"], &json!(id));
+        }
+
+        /// Output is always serializable, so the load path can never produce a
+        /// value it cannot hand to PostgreSQL.
+        #[test]
+        fn output_always_serializes(mut body in arb_object()) {
+            body.insert("resourceType".to_owned(), json!("Observation"));
+            let out = transform_resource(&Value::Object(body), map_v4()).unwrap();
+            prop_assert!(serde_json::to_string(&out).is_ok());
+        }
+
+        /// Every version behaves consistently on the same arbitrary input.
+        #[test]
+        fn no_version_panics_on_arbitrary_input(mut body in arb_object()) {
+            body.insert("resourceType".to_owned(), json!("Patient"));
+            let input = Value::Object(body);
+            for &version in crate::assets::ALL_VERSIONS {
+                let map = version.transform_map().unwrap();
+                prop_assert!(transform_resource(&input, map).is_ok());
+            }
+        }
+    }
 }

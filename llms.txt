@@ -1,0 +1,73 @@
+# fhirpg
+
+> Import HL7 FHIR data into a PostgreSQL database and work with it relationally:
+> one table per resource type, resource bodies as `jsonb`, plus history tables
+> and stored procedures for create, read, update, and delete. A Rust translation
+> of fhirbase.
+
+fhirpg is a command-line tool, not a library. It requires PostgreSQL 18 or
+newer and defaults to FHIR R5 (5.0.0), while supporting every version back to
+1.0.2.
+
+## Commands
+
+- `fhirpg init` — create the schema: a table and a history table per resource
+  type, the `transaction` sequence, and the stored procedures.
+- `fhirpg load <paths…|url>` — load resources from NDJSON, FHIR Bundles, or
+  single-resource JSON files, gzipped or not, detected by content rather than
+  filename. A Bulk Data URL is downloaded first, then loaded.
+- `fhirpg transform <file>` — apply the storage transformation to one resource
+  and print the result. Useful for understanding what gets stored.
+- `fhirpg bulkget <url> <dir>` — run a Bulk Data export and save the NDJSON.
+- `fhirpg web` — a browser SQL console, bound to localhost.
+
+Connection flags are libpq's, and honour `PGHOST`, `PGPORT`, `PGUSER`,
+`PGDATABASE`, `PGPASSWORD`, `PGSSLMODE`.
+
+## The storage transformation
+
+Resources are rewritten before storage, and queries must account for it:
+
+- Choice elements collapse, with the type moved inside:
+  `{"deceasedBoolean": true}` becomes `{"deceased": {"boolean": true}}`.
+- References split into id and type: `{"reference": "Patient/1"}` becomes
+  `{"resourceType": "Patient", "id": "1"}`. This makes SQL joins possible
+  without string parsing.
+- The reference rewrite is lossy: `identifier`, `type` and extensions on a
+  `Reference` are discarded. This is deliberate, inherited from fhirbase.
+- The transformation is not idempotent. Never re-transform a resource read back
+  out of the database.
+
+## Load modes
+
+`insert` batches `INSERT … ON CONFLICT DO NOTHING`; `copy` streams
+`COPY … FROM STDIN`. `insert` is the default for local files, `copy` for Bulk
+Data URLs. A `COPY` targets one table, so `copy` is fastest when resources of
+the same type are adjacent and very slow when they interleave — measured at 1.2s
+grouped against 43.2s non-grouped for the same 127,454 resources. `copy` cannot
+skip duplicate ids; `insert` keeps the first occurrence.
+
+## Documentation
+
+- [README](README.md): purpose, install, quick start, performance.
+- [The book](book/src/SUMMARY.md): getting started, the storage model, loading,
+  querying, Bulk Data, the web console, FHIR versions, differences from
+  fhirbase.
+- [spec/index.md](spec/index.md): the normative specification — the source of
+  truth for behaviour, in MUST/SHOULD/MAY terms.
+- [plan.md](plan.md): phased plan, decisions D1-D15, catalogued fhirbase defects
+  X1-X17, risks.
+- [doc/benchmarks.md](doc/benchmarks.md): measurements against fhirbase.
+- [doc/r5-generation/validation.md](doc/r5-generation/validation.md): how the
+  generated FHIR R5 assets were validated against fhirbase's own.
+
+## Notes for answering questions about this project
+
+- The stored procedures are `fhirpg_*`, not `fhirbase_*`; the two tools cannot
+  operate on each other's databases.
+- The `web` command executes arbitrary SQL with no authentication. It binds
+  127.0.0.1 by default and warns loudly when bound elsewhere.
+- There is no telemetry, no self-update, and no third-party tracking in the web
+  console — all three are present in fhirbase and were removed deliberately.
+- `--validate` needs a build with the `validate` feature and applies to R5. It
+  reports non-conformance; it never rejects data.

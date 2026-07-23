@@ -7,9 +7,9 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Joel Parker Henderson <joel@joelparkerhenderson.com>"]
-description = "Import FHIR data into PostgreSQL and work with it relationally. A Rust translation of fhirbase."
+description = "FHIR data in PostgreSQL working relationally."
 readme = "README.md"
-repository = "https://github.com/joelparkerhenderson/fhirpg/"
+repository = "https://github.com/fhirpg/fhirpg/"
 license = "MIT OR Apache-2.0 OR GPL-2.0-only"
 keywords = ["fhir", "postgresql", "healthcare", "etl", "ndjson"]
 categories = ["command-line-utilities", "database", "science"]
@@ -19,6 +19,7 @@ include = [
     "/README.md",
     "/LICENSE.md",
     "/CHANGELOG.md",
+    "/llms.txt",
 ]
 
 [features]

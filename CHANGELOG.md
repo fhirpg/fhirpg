@@ -27,11 +27,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - UUIDv7 identifier generation (T11b) and the `RETURNING OLD` archival rewrite,
   which also fixes X13, X14, and X15 (T11c).
 
+- Optional `--validate`, behind the non-default `validate` feature, checking
+  resources against the typed FHIR R5 model from the `fhir` crate. It reports
+  non-conformance; it never rejects data (T24).
+- Documentation: an mdBook under `book/`, `llms.txt`, benchmark results, the
+  R5 generation record, and fhirbase's `doc/scenarios.md` (T26).
+
 ### Notes
 
-This release is planning and scaffolding only; no command does anything yet.
-The delivery plan is in [`plan.md`](plan.md), the ordered task list in
-[`tasks.md`](tasks.md), and the normative behaviour in
+All five commands work. The delivery plan is in [`plan.md`](plan.md), the
+ordered task list in [`tasks.md`](tasks.md), and the normative behaviour in
 [`spec/index.md`](spec/index.md).
 
 Deliberate divergences from fhirbase, decided during planning:

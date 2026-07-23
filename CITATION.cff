@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-title: fhirpg — FHIR to PostgreSQL
+title: fhirpg — FHIR PostgreSQL
 message: >-
   If you use this work and you want to cite it,
   then you can use the metadata from this file.
@@ -14,17 +14,16 @@ identifiers:
   - type: url
     value: 'https://github.com/joelparkerhenderson/fhirpg/'
     description: >-
-      A command-line utility that imports HL7 FHIR data into a PostgreSQL
-      database and stores it relationally. A Rust translation of fhirbase.
+      A command-line utility that works with HL7 FHIR data in a PostgreSQL
+      database and stores it relationally.
 repository-code: 'https://github.com/joelparkerhenderson/fhirpg/'
 abstract: >-
   fhirpg imports HL7 FHIR data into a PostgreSQL database and stores it
   relationally: one table per resource type, resource bodies as jsonb, with
   history tables and stored procedures for create, read, update, and delete.
-  It is a Rust translation of fhirbase, a Go utility by Health Samurai, and is
-  released under the MIT License with attribution to that work. HL7, FHIR, and
-  the FHIR [FLAME DESIGN] are registered trademarks of Health Level Seven
-  International, and their use does not constitute endorsement by HL7.
+  HL7, FHIR, and the FHIR [FLAME DESIGN] are registered trademarks of 
+  Health Level Seven International, and their use does not constitute 
+  endorsement by HL7.
 keywords:
   - FHIR
   - PostgreSQL

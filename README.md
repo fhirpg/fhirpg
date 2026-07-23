@@ -9,28 +9,72 @@ and delete.
 [fhirbase](https://github.com/fhirbase/fhirbase), a Go utility by Health
 Samurai that has been unmaintained since 2019.
 
-> **Status: in development.** All five commands work against PostgreSQL 18, at
-> every FHIR version from 1.0.2 to 5.0.0. Remaining: benchmarks, documentation,
-> and release. The delivery plan is in [`plan.md`](plan.md), the ordered task
-> list in [`tasks.md`](tasks.md), and the normative behaviour in
+> **Status: pre-release.** All five commands work against PostgreSQL 18, at
+> every FHIR version from 1.0.2 to 5.0.0, with 172 tests plus 43 that run
+> against a live database. Not yet published to crates.io. The delivery plan is
+> in [`plan.md`](plan.md) and the normative behaviour in
 > [`spec/index.md`](spec/index.md).
 
-## What it will do
+## Quick start
 
 ```sh
-fhirpg --db clinic init                  # create the schema
-fhirpg --db clinic load export/*.ndjson  # bulk-load resources
-fhirpg --db clinic web                   # browse with SQL
+cargo install fhirpg
+export PGHOST=localhost PGUSER=you PGDATABASE=clinic
+
+fhirpg init                       # create the schema
+fhirpg load export/*.ndjson       # load resources
+fhirpg web                        # browse with SQL
 ```
 
-Then query the data as ordinary relational data:
+Then query it as ordinary relational data:
 
 ```sql
-SELECT resource->>'birthDate' AS dob, count(*)
-FROM patient
-GROUP BY 1
-ORDER BY 2 DESC;
+SELECT resource->>'gender' AS gender, count(*)
+  FROM patient
+ GROUP BY 1 ORDER BY 2 DESC;
 ```
+
+References are split into an id and a type when stored, so joins need no string
+parsing:
+
+```sql
+SELECT p.resource->'name'->0->>'family' AS family,
+       count(o.id) AS observations
+  FROM patient p
+  LEFT JOIN observation o ON o.resource->'subject'->>'id' = p.id
+ GROUP BY 1 ORDER BY 2 DESC;
+```
+
+Choice elements are collapsed, with the type moved inside — `deceasedBoolean`
+becomes `deceased.boolean`. See [the storage model](book/src/storage-model.md),
+or just look:
+
+```sh
+fhirpg transform patient.json
+```
+
+## Commands
+
+| | |
+| --- | --- |
+| `fhirpg init` | create the schema for a FHIR version |
+| `fhirpg load <paths…\|url>` | load NDJSON, Bundles, or single resources; gzipped or not |
+| `fhirpg transform <file>` | show what one resource becomes when stored |
+| `fhirpg bulkget <url> <dir>` | run a Bulk Data export and save the NDJSON |
+| `fhirpg web` | a browser SQL console, bound to localhost |
+
+Formats and compression are detected by **content, not filename**. Memory is
+bounded by the largest single resource: a 1 GB Bundle reads with about 2 MB of
+growth.
+
+## Documentation
+
+- **[The book](book/src/SUMMARY.md)** — getting started, the storage model,
+  loading, querying, Bulk Data, the web console, FHIR versions.
+- [`spec/index.md`](spec/index.md) — the normative specification.
+- [`doc/benchmarks.md`](doc/benchmarks.md) — measurements against fhirbase.
+- [`plan.md`](plan.md) — decisions D1–D15 and the catalogued fhirbase defects
+  X1–X17.
 
 ## Performance
 

@@ -9,10 +9,11 @@ and delete.
 [fhirbase](https://github.com/fhirbase/fhirbase), a Go utility by Health
 Samurai that has been unmaintained since 2019.
 
-> **Status: in development.** Planning and scaffolding are done; no command does
-> anything yet. The delivery plan is in [`plan.md`](plan.md), the ordered task
+> **Status: in development.** All five commands work against PostgreSQL 18, at
+> every FHIR version from 1.0.2 to 5.0.0. Remaining: benchmarks, documentation,
+> and release. The delivery plan is in [`plan.md`](plan.md), the ordered task
 > list in [`tasks.md`](tasks.md), and the normative behaviour in
-> [`spec/index.md`](spec/index.md). Follow along there.
+> [`spec/index.md`](spec/index.md).
 
 ## What it will do
 

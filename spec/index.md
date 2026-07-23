@@ -238,17 +238,11 @@ Supported versions: **1.0.2, 1.1.0, 1.4.0, 1.6.0, 1.8.0, 3.0.1, 3.2.0, 3.3.0,
 §10). The default for `--fhir` is **5.0.0**, a deliberate divergence from
 fhirbase's 3.3.0 (decision D4).
 
-> **Interim state, to be removed at task T23.** The 5.0.0 assets are generated
-> by tasks T21 and T22 and do not exist yet, so 5.0.0 is not yet a selectable
-> version and the shipped default is fhirbase's **3.3.0**. Defaulting to a
-> version with no assets would make every command fail. T23 adds 5.0.0, flips
-> the default, and deletes this note.
-
 Each version has two assets:
 
 - `assets/schema/fhirpg-<version>.sql.json` — a JSON array of DDL
   statement strings, executed in order. 4.0.0 has 293 statements covering 145
-  resource tables.
+  resource tables; the generated 5.0.0 has 318 covering 158.
 - `assets/transform/fhirpg-import-<version>.json` — the transformation
   map of §4. 4.0.0 has 155 top-level entries, 929 `union` directives, and 737
   `reference` directives.

@@ -1,3 +1,6 @@
+[workspace]
+members = ["xtask"]
+
 [package]
 name = "fhirpg"
 version = "0.1.0"
@@ -38,16 +41,19 @@ axum = "0.8" # HTTP server for the web SQL console.
 deadpool-postgres = "0.14" # Connection pool for the web console (decision D2).
 serde = { version = "1", features = ["derive"] } # Deriving the web console's query-string extractor.
 
-[lints.rust]
+[workspace.lints.rust]
 unsafe_code = "forbid"
 
-[lints.clippy]
+[workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 # Spec invariant 2: no code path reachable from input may panic. These lints
 # make that a mechanical check rather than a code-review promise.
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
+
+[lints]
+workspace = true
 
 [dev-dependencies]
 proptest = "1" # Property-based tests for the transformation (spec §4.8).

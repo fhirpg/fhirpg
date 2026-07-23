@@ -156,15 +156,19 @@ mod tests {
         // different statement than intended.
         for &version in crate::assets::ALL_VERSIONS {
             let statements = version.schema_statements().unwrap();
-            assert!(
-                is_tolerable(&statements[0]),
-                "FHIR {version} no longer opens with CREATE EXTENSION pgcrypto"
-            );
-            assert_eq!(
-                statements.iter().filter(|s| is_tolerable(s)).count(),
-                1,
-                "FHIR {version} should have exactly one tolerable statement"
-            );
+            let tolerable = statements.iter().filter(|s| is_tolerable(s)).count();
+
+            if version == crate::assets::FhirVersion::V5_0_0 {
+                // The generated schema has no extension statement at all (D9),
+                // so there is nothing to tolerate.
+                assert_eq!(tolerable, 0, "the R5 schema should need no tolerance");
+            } else {
+                assert!(
+                    is_tolerable(&statements[0]),
+                    "FHIR {version} no longer opens with CREATE EXTENSION pgcrypto"
+                );
+                assert_eq!(tolerable, 1, "FHIR {version} should have one tolerable statement");
+            }
         }
     }
 

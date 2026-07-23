@@ -16,6 +16,14 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
+// The module's own tests exercise everything in it, so the expectation applies
+// only to the non-test build, where the transformation that consumes it (task
+// T6) does not exist yet.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the transformation in task T6")
+)]
+mod assets;
 mod cli;
 mod error;
 

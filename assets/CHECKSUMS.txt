@@ -1,0 +1,30 @@
+# SHA-256 of every vendored asset, verified by a test in src/assets.rs.
+#
+# The 18 per-version files and the transform maps are vendored BYTE-IDENTICAL
+# from fhirbase (only the filenames changed); these sums are therefore also
+# the upstream sums, and are the proof of that claim.
+#
+# functions.sql.json is the one sanctioned exception: task T10 rebrands its
+# identifiers fhirbase_* -> fhirpg_* per decision D3, and updates this line.
+#
+# Regenerate:  (cd assets && shasum -a 256 schema/*.json transform/*.json)
+
+4ad933576077f93d974445c1482e572f33b9a8af20e3cf84cab0a332e9b6d2b8  schema/fhirpg-1.0.2.sql.json
+665ce4aa4dc893225db2dc52e5b155aea3c5e49de34e34c88d6bb4dd96f92382  schema/fhirpg-1.1.0.sql.json
+0af5e7a9492f13c3ba1e6d30db07f57aee69fab33ccf8909c5667a564ddedc63  schema/fhirpg-1.4.0.sql.json
+24bdf067b4d968b47d15784652444f94cd5fc4dd60d2ffebc882b8a11ae1571d  schema/fhirpg-1.6.0.sql.json
+3d1d42491769292a39dccef535c2554a4302f43b6fc119f0093e8f7e563eb2d3  schema/fhirpg-1.8.0.sql.json
+fe153b27058c3cfc0fbb0334cdbe46720ee8f75b57b150f370cd98f2d4c0bc7a  schema/fhirpg-3.0.1.sql.json
+a9b805eceb113c2504633857a452f91bdd9acf32615137237ca3e9bfe5bbcf20  schema/fhirpg-3.2.0.sql.json
+7327024f8e8e4c1284679df7c2cdc66c95625d7d6e244698a5461a5e1c1a469f  schema/fhirpg-3.3.0.sql.json
+cecc4eee7b6ebeaae5a5b68d47f19924fff10038121d191c30411feaf098b933  schema/fhirpg-4.0.0.sql.json
+e708e299c069e1fd4275cb5b4a98c83e3d7e525f22fbb6b470e4db16496e2feb  schema/functions.sql.json
+c4eead7b59dda11ef18cd7ab98e89ea1a59cdc94a34936ce5b17b2de5c6096e4  transform/fhirpg-import-1.0.2.json
+7787d694ee2eb96a5b11735b90e84e8e3da49f99f4067b35461946f818c89483  transform/fhirpg-import-1.1.0.json
+0c13fbbc69226264dd2cd69506d7fdf16c6a95bba2eb3c42d6b09f392b0205e1  transform/fhirpg-import-1.4.0.json
+266023d80573ed2df083fc7b155e335d10f7985e9715a97f2f224dd8a803c13e  transform/fhirpg-import-1.6.0.json
+97c61a4ee6798bd54e1772ca7ef252adbfe288103eda651c35ac407244ffdbe5  transform/fhirpg-import-1.8.0.json
+77ff9dd072f44d2d2b05cf93e7527c32c653a4c4ea01bc79903fa82cc5007cb6  transform/fhirpg-import-3.0.1.json
+c96b45e82273a08ce3eac31b33a8c39459f1867e07de6db396a1fb99b3b6d7ac  transform/fhirpg-import-3.2.0.json
+331edc85028f51ca16679e29c15ba31348694c9518169d2c2df728029e63f443  transform/fhirpg-import-3.3.0.json
+f0bf2713f0779d68bfdb5761d977da7113d11108141829146ca67681dbb2b0d0  transform/fhirpg-import-4.0.0.json

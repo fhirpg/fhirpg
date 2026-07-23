@@ -274,6 +274,15 @@ keeping the first occurrence. When unsure, use insert.")]
         #[arg(long = "txid", value_name = "new")]
         txid: Option<TxidMode>,
 
+        /// Check each resource against the typed FHIR R5 model and report what
+        /// does not conform.
+        ///
+        /// Needs a build with `--features validate`, and applies to FHIR 5.0.0.
+        /// Reports; it does not reject — the loader stores non-conforming data
+        /// on purpose. Use `--strict` to abort on the first finding.
+        #[arg(long)]
+        validate: bool,
+
         /// Report process resident set size (RSS) during the load.
         ///
         /// Note this is RSS, not heap allocation: fhirbase's flag of the same

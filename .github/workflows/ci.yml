@@ -35,6 +35,19 @@ jobs:
         env:
           PROPTEST_CASES: 10000
 
+  features:
+    name: Feature builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The `validate` feature pulls in the typed FHIR R5 model (task T24). It
+      # must build and pass on its own, and the default build must not need it.
+      - run: cargo build --all-targets --features validate
+      - run: cargo test --features validate
+      - run: cargo clippy --all-targets --features validate -- -D warnings
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

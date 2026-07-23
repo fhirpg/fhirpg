@@ -38,6 +38,8 @@ mod procedures_suite;
 #[cfg(test)]
 mod testdb;
 mod transform;
+#[cfg(feature = "validate")]
+mod validate;
 
 use std::str::FromStr;
 
@@ -89,6 +91,7 @@ fn run(cli: &Cli) -> error::Result<()> {
             count_first,
             memusage,
             txid,
+            validate,
             bulk,
         } => {
             let config = PgConfig::from_args(&cli.connection);
@@ -99,6 +102,7 @@ fn run(cli: &Cli) -> error::Result<()> {
                 count_first: *count_first,
                 memusage: *memusage,
                 new_txid: txid.is_some(),
+                validate: *validate,
                 bulk: crate::bulk::BulkOptions {
                     accept_header: bulk.accept_header.clone(),
                     parallel: usize::from(bulk.numdl),

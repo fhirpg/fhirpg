@@ -21,6 +21,12 @@ include = [
     "/CHANGELOG.md",
 ]
 
+[features]
+# Check each resource against the typed FHIR R5 model while loading
+# (`--validate`). Off by default: it pulls in ~135k lines of generated Rust and
+# the loader is deliberately untyped otherwise (see AGENTS/architecture.md).
+validate = ["dep:fhir"]
+
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"] } # Command-line argument parser; `env` backs the libpq PG* variables (spec §6).
 thiserror = "2.0" # Derive macro for the typed error enum in `src/error.rs`.
@@ -40,6 +46,7 @@ tempfile = "3" # Scratch directory for Bulk Data downloads, removed on drop.
 axum = "0.8" # HTTP server for the web SQL console.
 deadpool-postgres = "0.14" # Connection pool for the web console (decision D2).
 serde = { version = "1", features = ["derive"] } # Deriving the web console's query-string extractor.
+fhir = { version = "1.2", default-features = false, features = ["r5"], optional = true }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

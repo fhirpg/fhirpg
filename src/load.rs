@@ -37,6 +37,11 @@ pub struct LoadOptions {
     pub txid: i64,
     /// How many resources to buffer before writing.
     pub batch_size: usize,
+    /// Check each resource against the typed FHIR model (task T24).
+    ///
+    /// Only meaningful in a build with the `validate` feature; ignored
+    /// otherwise, because there is no model to check against.
+    pub validate: bool,
 }
 
 impl LoadOptions {
@@ -51,6 +56,7 @@ impl LoadOptions {
             strict: false,
             txid: 0,
             batch_size: Self::DEFAULT_BATCH_SIZE,
+            validate: false,
         }
     }
 }
@@ -72,6 +78,11 @@ pub struct LoadStats {
     pub transform_failed: u64,
     /// Resources skipped because they were not a JSON object with a type.
     pub malformed: u64,
+    /// Resources that did not conform to the typed FHIR model (task T24).
+    ///
+    /// Counted, never skipped: validation reports, it does not gate. Zero
+    /// unless `--validate` is on.
+    pub not_conforming: u64,
 }
 
 impl LoadStats {
@@ -169,6 +180,27 @@ pub fn prepare(
             Ok(None)
         };
     };
+
+    // Task T24. Validation happens on the resource AS READ, before the
+    // transformation, because the model describes FHIR's own JSON rather than
+    // the storage representation. It reports and continues: the loader is meant
+    // to store data a strict model would reject.
+    #[cfg(feature = "validate")]
+    if options.validate {
+        let findings = crate::validate::validate_resource(resource, options.version);
+        if !findings.is_clean() {
+            stats.not_conforming += 1;
+            if options.strict {
+                return Err(Error::transform(
+                    resource_type,
+                    format!("does not conform: {}", findings.issues.join("; ")),
+                ));
+            }
+            for issue in &findings.issues {
+                eprintln!("{resource_type}: {issue}");
+            }
+        }
+    }
 
     // Defect X3. fhirbase shadows the error here, prints it, and queues the
     // possibly-null result for insertion regardless.

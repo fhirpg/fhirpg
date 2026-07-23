@@ -53,6 +53,29 @@ PostgreSQL 18 at all** with default authentication — its 2018-vintage driver
 predates SCRAM-SHA-256. The benchmark only runs against a server reconfigured
 for trust authentication.
 
+## Optional: validation
+
+A build with the `validate` feature can check each resource against the typed
+FHIR R5 model from the [`fhir`](https://crates.io/crates/fhir) crate:
+
+```sh
+cargo install fhirpg --features validate
+fhirpg --db clinic load --validate export/*.ndjson
+```
+
+```
+Patient: gender.code: code "platypus" is not in the required value set
+Observation: does not match the FHIR R5 model: missing field `status`
+
+3 resource(s) did not conform to the FHIR model, and were loaded anyway.
+```
+
+It **reports; it does not reject.** Storing data a strict model would refuse is
+the point of the tool, so non-conforming resources are counted and written —
+`--strict` turns the first finding into an aborted run if you want that. The
+feature is off by default because it compiles a large generated model that a
+normal load never touches.
+
 ## Requirements
 
 - **PostgreSQL 18 or newer.** The stored procedures use `uuidv7()` for

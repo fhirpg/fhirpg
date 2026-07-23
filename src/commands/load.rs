@@ -46,6 +46,8 @@ pub struct LoadRequest {
     pub memusage: bool,
     /// Allocate a real transaction id instead of writing `0` (defect X10).
     pub new_txid: bool,
+    /// Check resources against the typed FHIR model (task T24).
+    pub validate: bool,
     /// Bulk Data options, used only when the source is a URL.
     pub bulk: crate::bulk::BulkOptions,
 }
@@ -104,6 +106,19 @@ pub async fn run(config: &PgConfig, version: FhirVersion, request: &LoadRequest)
 
     let mut options = LoadOptions::new(version);
     options.strict = request.strict;
+    options.validate = request.validate;
+
+    if request.validate {
+        #[cfg(feature = "validate")]
+        crate::validate::check_supported(version)?;
+
+        #[cfg(not(feature = "validate"))]
+        return Err(Error::Config(
+            "--validate needs a build with the `validate` feature: \
+             cargo install fhirpg --features validate"
+                .to_owned(),
+        ));
+    }
     if request.new_txid {
         options.txid = allocate_txid(&client).await?;
     }
@@ -256,6 +271,16 @@ fn report(
         println!("  {resource_type:<width$} {count:>9}");
     }
 
+    // Reported before the early return below, because a non-conforming
+    // resource is NOT skipped — it was written, and the count would otherwise
+    // vanish whenever nothing else went wrong, which is the common case.
+    if stats.not_conforming > 0 {
+        println!(
+            "\n{} resource(s) did not conform to the FHIR model, and were loaded anyway.",
+            stats.not_conforming
+        );
+    }
+
     // Spec §8.4: skipped resources AND unreadable files belong in the summary,
     // not only in scrollback. fhirbase reports neither.
     if !skipped_files.is_empty() {
@@ -283,6 +308,7 @@ fn report(
     if stats.malformed > 0 {
         println!("  {:>9}  malformed or unreadable", stats.malformed);
     }
+
 }
 
 #[cfg(test)]
@@ -297,6 +323,7 @@ mod tests {
             count_first: false,
             memusage: false,
             new_txid: false,
+            validate: false,
             bulk: crate::bulk::BulkOptions::default(),
         }
     }
@@ -451,6 +478,7 @@ mod bulk_load_tests {
             count_first: false,
             memusage: false,
             new_txid: false,
+            validate: false,
             bulk: crate::bulk::BulkOptions {
                 poll_interval: std::time::Duration::from_millis(1),
                 max_polls: 20,

@@ -518,9 +518,17 @@ Binary: `fhirpg`. Global flags per §6, plus `-f, --fhir`. Subcommands:
 
 Command-specific flags: `load` takes `-m/--mode` (`insert` \| `copy`), `--numdl`
 (default 5), `--accept-header` (default `application/fhir+json`), `--strict`
-(§8.2), `--count-first` (§5.4), `--txid=new` (§8.2), and `--memusage`;
+(§8.2), `--count-first` (§5.4), `--txid=new` (§8.2), `--memusage`, and `--validate`;
 `bulkget` takes `--numdl` and `--accept-header`; `web` takes `--webport`
 (default 3000) and `--webhost` (default `127.0.0.1` — see §9).
+
+`--validate` checks each resource against the typed FHIR model and reports what
+does not conform. It MUST report rather than reject: the loader exists to store
+data a strict model would refuse, so a non-conforming resource is counted and
+written, and only `--strict` turns a finding into an aborted run. It requires a
+build with the `validate` feature, and MUST fail with an actionable message when
+the selected FHIR version has no model in that build rather than silently
+checking nothing.
 
 `--memusage` reports the process's **resident set size**, current and peak,
 sampled every 3,000 resources. fhirbase's flag of the same name prints Go

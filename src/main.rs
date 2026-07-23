@@ -24,6 +24,7 @@
     expect(dead_code, reason = "schema accessors are consumed by tasks T11-T15")
 )]
 mod assets;
+mod bulk;
 mod bundle;
 mod cli;
 mod commands;
@@ -88,7 +89,7 @@ fn run(cli: &Cli) -> error::Result<()> {
             count_first,
             memusage,
             txid,
-            ..
+            bulk,
         } => {
             let config = PgConfig::from_args(&cli.connection);
             let request = commands::load::LoadRequest {
@@ -98,13 +99,22 @@ fn run(cli: &Cli) -> error::Result<()> {
                 count_first: *count_first,
                 memusage: *memusage,
                 new_txid: txid.is_some(),
+                bulk: crate::bulk::BulkOptions {
+                    accept_header: bulk.accept_header.clone(),
+                    parallel: usize::from(bulk.numdl),
+                    ..crate::bulk::BulkOptions::default()
+                },
             };
             runtime()?.block_on(commands::load::run(&config, version, &request))
         }
-        Command::Bulkget { .. } => Err(Error::NotImplemented {
-            command: "bulkget",
-            task: "T18",
-        }),
+        Command::Bulkget { url, dir, bulk } => {
+            let options = crate::bulk::BulkOptions {
+                accept_header: bulk.accept_header.clone(),
+                parallel: usize::from(bulk.numdl),
+                ..crate::bulk::BulkOptions::default()
+            };
+            runtime()?.block_on(commands::bulkget::run(url, dir, &options))
+        }
         Command::Web { .. } => Err(Error::NotImplemented {
             command: "web",
             task: "T20",
@@ -136,15 +146,15 @@ mod tests {
 
     #[test]
     fn unimplemented_commands_name_their_task() {
-        // Repointed from `init` when T11 landed. When the last of these is
-        // implemented, delete this test along with `Error::NotImplemented`.
-        let cli =
-            Cli::try_parse_from(["fhirpg", "bulkget", "http://x", "/tmp"]).unwrap_or_else(|e| panic!("{e}"));
+        // Repointed as tasks land: `init` (T11), then `bulkget` (T18). `web`
+        // is the last one; when T20 lands, delete this test along with
+        // `Error::NotImplemented`.
+        let cli = Cli::try_parse_from(["fhirpg", "web"]).unwrap_or_else(|e| panic!("{e}"));
         let message = match run(&cli) {
             Err(e) => e.to_string(),
-            Ok(()) => panic!("bulkget is not implemented yet"),
+            Ok(()) => panic!("web is not implemented yet"),
         };
-        assert!(message.contains("bulkget"), "{message}");
-        assert!(message.contains("T18"), "{message}");
+        assert!(message.contains("web"), "{message}");
+        assert!(message.contains("T20"), "{message}");
     }
 }

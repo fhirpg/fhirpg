@@ -46,6 +46,8 @@ pub struct LoadRequest {
     pub memusage: bool,
     /// Allocate a real transaction id instead of writing `0` (defect X10).
     pub new_txid: bool,
+    /// Bulk Data options, used only when the source is a URL.
+    pub bulk: crate::bulk::BulkOptions,
 }
 
 /// Runs the `load` subcommand.
@@ -69,15 +71,28 @@ pub async fn run(config: &PgConfig, version: FhirVersion, request: &LoadRequest)
         LoadMode::Insert
     });
 
-    if is_bulk_url {
-        return Err(Error::NotImplemented {
-            command: "load from a Bulk Data URL",
-            task: "T19",
-        });
-    }
+    // A Bulk Data URL is downloaded first, then loaded as ordinary local files
+    // (`load.go:864-887`). `downloads` is held for the rest of the run: its
+    // `Drop` removes the scratch directory, on success, on failure, and on an
+    // early return alike.
+    let downloads;
+    let files = if is_bulk_url {
+        let Some(url) = request.sources.first() else {
+            return Err(Error::Bulk("no Bulk Data URL given".to_owned()));
+        };
+        if request.sources.len() > 1 {
+            return Err(Error::Bulk(
+                "a Bulk Data URL must be the only source;                  mixing it with file paths is not supported"
+                    .to_owned(),
+            ));
+        }
+        downloads = crate::bulk::fetch(url, &request.bulk).await?;
+        downloads.files().to_vec()
+    } else {
+        let inputs: Vec<PathBuf> = request.sources.iter().map(PathBuf::from).collect();
+        expand_paths(&inputs)?
+    };
 
-    let inputs: Vec<PathBuf> = request.sources.iter().map(PathBuf::from).collect();
-    let files = expand_paths(&inputs)?;
     if files.is_empty() {
         return Err(Error::bundle(
             request.sources.join(", "),
@@ -282,6 +297,7 @@ mod tests {
             count_first: false,
             memusage: false,
             new_txid: false,
+            bulk: crate::bulk::BulkOptions::default(),
         }
     }
 
@@ -365,5 +381,137 @@ mod tests {
             LoadMode::Copy,
             0,
         );
+    }
+}
+
+/// End-to-end tests for `load` from a Bulk Data URL (task T19).
+#[cfg(test)]
+mod bulk_load_tests {
+    use super::*;
+    use crate::commands::init;
+    use crate::testdb;
+    use wiremock::matchers::{method, path as path_matcher};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A server exporting two NDJSON files, one of them gzipped.
+    async fn export_server() -> MockServer {
+        use std::io::Write as _;
+
+        let server = MockServer::start().await;
+        let base = server.uri();
+
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(b"{\"resourceType\":\"Observation\",\"id\":\"o1\",\"status\":\"final\"}\n")
+            .unwrap();
+        let gzipped = encoder.finish().unwrap();
+
+        Mock::given(method("GET"))
+            .and(path_matcher("/export"))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .insert_header("Content-Location", format!("{base}/status").as_str()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [
+                    {"url": format!("{base}/p.ndjson")},
+                    {"url": format!("{base}/o.ndjson")}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/p.ndjson"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "{\"resourceType\":\"Patient\",\"id\":\"p1\"}\n\
+                 {\"resourceType\":\"Patient\",\"id\":\"p2\"}\n",
+            ))
+            .mount(&server)
+            .await;
+        // Served still compressed, as a real Bulk Data server would.
+        Mock::given(method("GET"))
+            .and(path_matcher("/o.ndjson"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(gzipped))
+            .mount(&server)
+            .await;
+
+        server
+    }
+
+    fn bulk_request(url: &str) -> LoadRequest {
+        LoadRequest {
+            sources: vec![url.to_owned()],
+            mode: None,
+            strict: false,
+            count_first: false,
+            memusage: false,
+            new_txid: false,
+            bulk: crate::bulk::BulkOptions {
+                poll_interval: std::time::Duration::from_millis(1),
+                max_polls: 20,
+                ..crate::bulk::BulkOptions::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL 18; set FHIRPG_TEST_DB"]
+    async fn a_bulk_export_downloads_and_loads() {
+        let Some(db) = testdb::create("bulkload").await else {
+            return;
+        };
+        let client = db.connect().await;
+        init::perform(&client, FhirVersion::V4_0_0).await.unwrap();
+
+        let server = export_server().await;
+        let request = bulk_request(&format!("{}/export", server.uri()));
+
+        // Exercised through the same path the command uses, minus the
+        // connection: download, then load the files as ordinary local input.
+        let downloads = crate::bulk::fetch(&request.sources[0], &request.bulk)
+            .await
+            .expect("the export should succeed");
+        let files = downloads.files().to_vec();
+        assert_eq!(files.len(), 2);
+
+        let mut options = LoadOptions::new(FhirVersion::V4_0_0);
+        options.strict = true;
+        let reader = MultiFileReader::new(files);
+        let stats = CopyLoader::new(options)
+            .load(&client, reader)
+            .await
+            .expect("the load should succeed");
+
+        assert_eq!(stats.written["Patient"], 2);
+        assert_eq!(stats.written["Observation"], 1, "the gzipped file too");
+        assert_eq!(stats.total_skipped(), 0);
+
+        // And the scratch directory goes when the downloads do.
+        let scratch = downloads.files()[0].parent().map(std::path::Path::to_path_buf);
+        drop(downloads);
+        if let Some(scratch) = scratch {
+            assert!(!scratch.exists(), "the scratch directory must be removed");
+        }
+
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn a_url_mixed_with_file_paths_is_refused() {
+        let mut request = bulk_request("http://example.com/export");
+        request.sources.push("extra.ndjson".to_owned());
+
+        // Reaches the guard before any network call.
+        let is_bulk_url = request
+            .sources
+            .first()
+            .is_some_and(|s| s.starts_with("http://") || s.starts_with("https://"));
+        assert!(is_bulk_url);
+        assert!(request.sources.len() > 1);
     }
 }

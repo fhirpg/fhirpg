@@ -14,12 +14,6 @@
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Everything that can go wrong in `fhirpg`.
-///
-/// Several variants are declared ahead of the code that constructs them: the
-/// error surface is specified up front, and the tasks that raise each variant
-/// land later. The `expect` below turns into a warning once every variant is
-/// live, which is the signal to delete it.
-#[expect(dead_code, reason = "variants are raised by tasks T5-T20, not yet written")]
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {

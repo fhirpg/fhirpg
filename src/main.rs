@@ -30,6 +30,8 @@ mod config;
 mod db;
 mod error;
 #[cfg(test)]
+mod procedures_suite;
+#[cfg(test)]
 mod testdb;
 mod transform;
 

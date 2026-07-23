@@ -60,7 +60,7 @@ resource; `--txid=new` allocates a real one (defect X10).
 
 **D-numbers (D1-D14)** — settled decisions, in [`../plan.md`](../plan.md).
 
-**X-numbers (X1-X12)** — catalogued fhirbase defects that the port fixes rather
+**X-numbers (X1-X15)** — catalogued fhirbase defects that the port fixes rather
 than reproduces, in [`../plan.md`](../plan.md).
 
 **T-numbers (T1-T27)** — ordered tasks, in [`../tasks.md`](../tasks.md).

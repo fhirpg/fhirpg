@@ -42,4 +42,4 @@ panic = "deny"
 [dev-dependencies]
 proptest = "1" # Property-based tests for the transformation (spec §4.8).
 sha2 = "0.10" # Verifies that the vendored fhirbase assets are byte-identical (assets/CHECKSUMS.txt).
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] } # #[tokio::test] for the database tests.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] } # #[tokio::test] for the database tests.

@@ -351,12 +351,21 @@ mod db_tests {
             .await
             .unwrap();
 
+        // CONNECT but *not* CREATE on the database, and CREATE on the schema.
+        //
+        // That combination is the whole trick. `pgcrypto` is a **trusted**
+        // extension from PostgreSQL 13 on, so any role with CREATE on the
+        // database can install it — granting CREATE there made an earlier
+        // version of this test tolerate nothing and prove nothing. Withholding
+        // it denies `CREATE EXTENSION` ("must have CREATE privilege on current
+        // database") while `CREATE TABLE` still works, because that needs
+        // CREATE on the schema instead.
         let role = format!("fhirpg_limited_{}", std::process::id());
         admin
             .batch_execute(&format!(
                 "DROP ROLE IF EXISTS {role};
                  CREATE ROLE {role} LOGIN PASSWORD 'limited';
-                 GRANT CREATE, CONNECT ON DATABASE \"{}\" TO {role};
+                 GRANT CONNECT ON DATABASE \"{}\" TO {role};
                  GRANT CREATE, USAGE ON SCHEMA public TO {role};",
                 db.name()
             ))

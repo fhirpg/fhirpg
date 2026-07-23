@@ -26,19 +26,11 @@
 mod assets;
 mod cli;
 mod commands;
-// Both modules' own tests exercise them; `init` (T11) is the first non-test
-// consumer.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the init command in task T11")
-)]
 mod config;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the init command in task T11")
-)]
 mod db;
 mod error;
+#[cfg(test)]
+mod testdb;
 mod transform;
 
 use std::str::FromStr;
@@ -46,6 +38,7 @@ use std::str::FromStr;
 use clap::{CommandFactory, Parser};
 
 use crate::assets::FhirVersion;
+use crate::config::PgConfig;
 use crate::cli::{Cli, Command};
 use crate::error::Error;
 
@@ -78,10 +71,10 @@ fn run(cli: &Cli) -> error::Result<()> {
     let version = FhirVersion::from_str(&cli.fhir)?;
 
     match command {
-        Command::Init => Err(Error::NotImplemented {
-            command: "init",
-            task: "T11",
-        }),
+        Command::Init => {
+            let config = PgConfig::from_args(&cli.connection);
+            runtime()?.block_on(commands::init::run(&config, version))
+        }
         Command::Transform { file } => commands::transform::run(file, version),
         Command::Load { .. } => Err(Error::NotImplemented {
             command: "load",
@@ -96,6 +89,15 @@ fn run(cli: &Cli) -> error::Result<()> {
             task: "T20",
         }),
     }
+}
+
+/// Builds the async runtime on demand.
+///
+/// Built here rather than with `#[tokio::main]` so that commands needing no
+/// database — `transform` — start no runtime at all.
+fn runtime() -> error::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Runtime::new()
+        .map_err(|e| Error::Config(format!("cannot start the async runtime: {e}")))
 }
 
 #[cfg(test)]
@@ -113,12 +115,15 @@ mod tests {
 
     #[test]
     fn unimplemented_commands_name_their_task() {
-        let cli = Cli::try_parse_from(["fhirpg", "init"]).unwrap_or_else(|e| panic!("{e}"));
+        // Repointed from `init` when T11 landed. When the last of these is
+        // implemented, delete this test along with `Error::NotImplemented`.
+        let cli =
+            Cli::try_parse_from(["fhirpg", "bulkget", "http://x", "/tmp"]).unwrap_or_else(|e| panic!("{e}"));
         let message = match run(&cli) {
             Err(e) => e.to_string(),
-            Ok(()) => panic!("init is not implemented yet"),
+            Ok(()) => panic!("bulkget is not implemented yet"),
         };
-        assert!(message.contains("init"), "{message}");
-        assert!(message.contains("T11"), "{message}");
+        assert!(message.contains("bulkget"), "{message}");
+        assert!(message.contains("T18"), "{message}");
     }
 }

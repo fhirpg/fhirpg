@@ -18,7 +18,7 @@ fe153b27058c3cfc0fbb0334cdbe46720ee8f75b57b150f370cd98f2d4c0bc7a  schema/fhirpg-
 a9b805eceb113c2504633857a452f91bdd9acf32615137237ca3e9bfe5bbcf20  schema/fhirpg-3.2.0.sql.json
 7327024f8e8e4c1284679df7c2cdc66c95625d7d6e244698a5461a5e1c1a469f  schema/fhirpg-3.3.0.sql.json
 cecc4eee7b6ebeaae5a5b68d47f19924fff10038121d191c30411feaf098b933  schema/fhirpg-4.0.0.sql.json
-e708e299c069e1fd4275cb5b4a98c83e3d7e525f22fbb6b470e4db16496e2feb  schema/functions.sql.json
+e280b0686776b245df0cb54e61b18e16eb9687f308670d2150a72cd93a78bdc9  schema/functions.sql.json
 c4eead7b59dda11ef18cd7ab98e89ea1a59cdc94a34936ce5b17b2de5c6096e4  transform/fhirpg-import-1.0.2.json
 7787d694ee2eb96a5b11735b90e84e8e3da49f99f4067b35461946f818c89483  transform/fhirpg-import-1.1.0.json
 0c13fbbc69226264dd2cd69506d7fdf16c6a95bba2eb3c42d6b09f392b0205e1  transform/fhirpg-import-1.4.0.json

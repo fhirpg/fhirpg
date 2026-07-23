@@ -591,6 +591,57 @@ mod tests {
     }
 
     #[test]
+    fn the_procedures_are_rebranded_and_carry_no_upstream_identifiers() {
+        // Decision D3. functions.sql.json is the one vendored asset we edit,
+        // and the edit must be total: a surviving `fhirbase_` identifier would
+        // mean a procedure that init creates under the old name, or worse, a
+        // call site pointing at a procedure that does not exist.
+        let statements = FhirVersion::function_statements().unwrap();
+        let joined = statements.join("\n");
+
+        assert!(
+            !joined.contains("fhirbase"),
+            "a fhirbase identifier survived the D3 rebrand"
+        );
+
+        // Both arities of create, update and delete, plus read, genid, and the
+        // internal row-to-resource helper.
+        for expected in [
+            "FUNCTION fhirpg_genid()",
+            "FUNCTION _fhirpg_to_resource(",
+            "FUNCTION fhirpg_create(resource jsonb, txid bigint)",
+            "FUNCTION fhirpg_create(resource jsonb)",
+            "FUNCTION fhirpg_update(resource jsonb, txid bigint)",
+            "FUNCTION fhirpg_update(resource jsonb)",
+            "FUNCTION fhirpg_read(resource_type text, id text)",
+            "FUNCTION fhirpg_delete(resource_type text, id text, txid bigint)",
+            "FUNCTION fhirpg_delete(resource_type text, id text)",
+        ] {
+            assert!(joined.contains(expected), "missing: {expected}");
+        }
+
+        // The `_resource` composite type keeps its unbranded name (spec §2.4).
+        assert!(joined.contains("CREATE TYPE _resource AS ("));
+
+        // The single-argument forms depend on the sequence that the schema's
+        // `transaction` table creates implicitly (spec §2.2).
+        assert!(joined.contains("nextval('transaction_id_seq')"));
+    }
+
+    #[test]
+    fn no_vendored_schema_asset_mentions_fhirbase() {
+        // The nine per-version schema files carry no branded identifiers at
+        // all, which is why the D3 rebrand touches exactly one file.
+        for &version in ALL_VERSIONS {
+            let joined = version.schema_statements().unwrap().join("\n");
+            assert!(
+                !joined.contains("fhirbase"),
+                "FHIR {version} schema unexpectedly mentions fhirbase"
+            );
+        }
+    }
+
+    #[test]
     fn every_transform_map_parses_and_validates() {
         // Top-level type counts, read from the vendored assets. Pinning the
         // exact numbers means a silently truncated or swapped asset fails here

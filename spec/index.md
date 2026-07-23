@@ -182,10 +182,25 @@ D13). Beyond removing an index lookup, this guarantees the row written to
 `_history` is the genuine pre-image of the row that was replaced: a sibling CTE
 reads the statement snapshot while `ON CONFLICT DO UPDATE` re-reads the live
 row, so under `READ COMMITTED` with a concurrent writer the two can diverge.
-That divergence is inferred from the SQL and MUST be demonstrated by a
-concurrency test before this rewrite is credited with fixing it; if the test
-cannot reproduce it, this requirement stands as a simplification only and the
-spec MUST be amended to say so.
+
+That divergence is **demonstrated**, not assumed. Against the translated
+procedures, `procedures_suite::d13_concurrency` reproduced it deterministically
+on PostgreSQL 18.4: a committed version was lost from history entirely. The
+same test now asserts the opposite and is the standing regression.
+
+Every SQL identifier a procedure builds MUST go through `format`'s `%I`, never
+`%s` (defect X15). Because `%I` quotes and therefore preserves case, while an
+unquoted identifier folds to lower case, the table name MUST be lowered
+explicitly before quoting; the `resourceType` **value** keeps its original case.
+
+`fhirpg_delete` MUST record status `'deleted'` on the history row it writes
+(defect X13), and MUST write **exactly one** history row. fhirbase writes two —
+the pre-image at its own `txid` and a second at the supplied one — which
+collides on `_history`'s `(id, txid)` primary key whenever the two are equal
+(defect X14), and that is the common case, since every bulk-loaded row has
+`txid = 0`. One row loses nothing: it carries the content that was live at
+deletion, and every earlier version was already archived by the create or
+update that superseded it.
 
 ### 2.5 Identifier generation
 

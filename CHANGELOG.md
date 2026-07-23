@@ -16,6 +16,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Actions CI running the green gate, the MSRV check, and the database suite (T3).
 - Typed error enum and the `clap` command-line skeleton: global connection flags
   and the five subcommands `init`, `transform`, `load`, `bulkget`, `web` (T4).
+- The FHIR transformation algorithm and the `transform` subcommand, verified
+  against fhirbase itself over 38 resources at 4 FHIR versions — 152 exact
+  matches — plus 8 property tests (T5-T8).
+- Connection configuration for all six libpq `sslmode` values, and a
+  PostgreSQL 18 version gate (T9).
+- The `init` subcommand: 305 statements for FHIR 4.0.0 (T10, T11).
+- The stored-procedure regression suite, including a deterministic concurrency
+  test for the history-archival race (T11a).
+- UUIDv7 identifier generation (T11b) and the `RETURNING OLD` archival rewrite,
+  which also fixes X13, X14, and X15 (T11c).
 
 ### Notes
 

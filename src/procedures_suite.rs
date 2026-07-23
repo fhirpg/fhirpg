@@ -1,21 +1,21 @@
 //! The stored-procedure behaviour suite (task T11a).
 //!
-//! Test-only module. This is the **safety net** that must exist before T11b
-//! changes identifier generation and T11c rewrites the archival SQL: it pins
-//! what `fhirpg_create`, `fhirpg_update`, `fhirpg_read`, and `fhirpg_delete`
-//! actually do today, against the faithfully translated procedures.
+//! Test-only module. Written in T11a as the **safety net** for T11b and T11c,
+//! and now the standing regression suite for the stored procedures.
 //!
-//! It has three kinds of test, and the distinction matters:
+//! It has three kinds of test, and the distinction still matters:
 //!
-//! 1. **Golden tests** — behaviour to preserve. T11c must leave every one of
-//!    these passing unchanged; that is how we know the rewrite preserved
-//!    semantics.
-//! 2. **Defect witnesses** — behaviour that is wrong and is scheduled to be
-//!    fixed. Each asserts the *current, broken* result and names the defect.
-//!    T11c flips them, and the flip is the evidence the fix landed.
-//! 3. **The concurrency test** — decision D13's justification. Either it
-//!    demonstrates the stale-pre-image race, or D13 is downgraded to a
-//!    simplification. See [`d13_concurrency`].
+//! 1. **Golden tests** — behaviour that must not change. Every one of these was
+//!    written against the faithfully translated procedures and still passes
+//!    unchanged after the T11c rewrite. That is the evidence the rewrite
+//!    preserved semantics.
+//! 2. **Defect regressions** (`x13_…`, `x14_…`, `x15_…`) — written first as
+//!    witnesses asserting the *broken* upstream behaviour, then flipped when
+//!    T11c fixed it. Each names the defect and what it used to do.
+//! 3. **[`d13_concurrency`]** — decision D13's justification. Against the
+//!    translated procedures this reproduced the stale-pre-image race; against
+//!    the rewrite it must not. The assertion is inverted from how it was first
+//!    written, and the comment records both outcomes.
 //!
 //! Every test here needs a live PostgreSQL 18 and is `#[ignore]`d.
 
@@ -256,11 +256,13 @@ async fn delete_removes_the_live_row_and_returns_the_pre_image() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL 18; set FHIRPG_TEST_DB"]
-async fn witness_x13_delete_never_records_the_deleted_status() {
-    // Defect X13. `fhirpg_delete`'s second CTE copies `status` from the live
-    // row instead of writing 'deleted', so the `resource_status` enum's
-    // 'deleted' value is never produced by any procedure and history cannot
-    // distinguish a delete from an update.
+async fn x13_delete_records_the_deleted_status() {
+    // Defect X13, fixed by T11c.
+    //
+    // Before: `fhirpg_delete`'s second CTE copied `status` from the live row,
+    // so the `resource_status` enum's 'deleted' value was never produced by
+    // anything and history could not distinguish a delete from an update. The
+    // witnessed sequence was ['created', 'updated', 'updated'].
     let Some((db, client)) = initialized("x13").await else {
         return;
     };
@@ -283,11 +285,32 @@ async fn witness_x13_delete_never_records_the_deleted_status() {
         .map(|(_, s)| s)
         .collect();
 
-    // CURRENT (broken): the delete is recorded as 'updated'.
-    assert_eq!(statuses, vec!["created", "updated", "updated"]);
-    assert!(
-        !statuses.iter().any(|s| s == "deleted"),
-        "X13 is fixed — flip this witness to assert the last status is 'deleted'"
+    assert_eq!(
+        statuses,
+        vec!["created", "deleted"],
+        "a delete must be distinguishable from an update in history"
+    );
+
+    // Two rows, not three, and that is deliberate. The old procedure wrote the
+    // pre-image TWICE on delete -- once at its own txid and once at the new one
+    // -- which is precisely where X14's primary-key collision came from. One
+    // row per delete loses nothing: the pre-image's *content* is carried on the
+    // delete row, and every earlier version was already archived by the create
+    // or update that superseded it. See spec §2.4.
+    let contents: Vec<Option<String>> = client
+        .query(
+            "SELECT resource->>'v' FROM patient_history WHERE id = 'p1' ORDER BY txid",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<_, Option<String>>(0))
+        .collect();
+    assert_eq!(
+        contents,
+        vec![None, Some("2".to_owned())],
+        "the delete row must carry the content that was live when it was deleted"
     );
 
     db.drop().await;
@@ -295,15 +318,17 @@ async fn witness_x13_delete_never_records_the_deleted_status() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL 18; set FHIRPG_TEST_DB"]
-async fn witness_x14_delete_collides_when_txid_matches_the_live_row() {
-    // Defect X14. `fhirpg_delete` inserts into `_history` twice: once with the
-    // row's existing txid and once with the given txid. `_history`'s primary
-    // key is (id, txid), so passing a txid equal to the row's current one is a
-    // unique violation.
+async fn x14_delete_accepts_a_txid_matching_the_live_row() {
+    // Defect X14, fixed by T11c.
     //
-    // This is not hypothetical. Every bulk-loaded resource is written with
-    // txid = 0 (fhirbase hardcodes it — defect X10), so
-    // `fhirpg_delete(rt, id, 0)` on loaded data always fails.
+    // Before: `fhirpg_delete` inserted into `_history` twice -- once with the
+    // row's existing txid, once with the supplied one -- and `_history`'s
+    // primary key is (id, txid), so a matching txid was a unique violation.
+    // Every bulk-loaded resource is written with txid = 0 (X10), so
+    // `fhirpg_delete(rt, id, 0)` on loaded data always failed.
+    //
+    // The RETURNING OLD rewrite removes the double write entirely: the delete
+    // returns its own pre-image, and exactly one history row is inserted.
     let Some((db, client)) = initialized("x14").await else {
         return;
     };
@@ -316,80 +341,79 @@ async fn witness_x14_delete_collides_when_txid_matches_the_live_row() {
         .await
         .unwrap();
 
-    let err = client
-        .query_one("SELECT fhirpg_delete('Patient','loaded',0)", &[])
-        .await
-        .expect_err("X14 is fixed — flip this witness");
+    let returned = call(&client, "SELECT fhirpg_delete('Patient','loaded',0)").await;
+    assert_eq!(returned["resourceType"], "Patient");
 
-    let message = describe(&err);
-    assert!(
-        message.contains("duplicate key") || message.contains("unique constraint"),
-        "expected a primary-key violation, got: {message}"
+    // Exactly one history row, carrying the delete.
+    assert_eq!(
+        history(&client, "loaded").await,
+        vec![(0, "deleted".to_owned())]
     );
 
-    // A distinct txid works, which is why this has gone unnoticed.
+    let remaining: i64 = client
+        .query_one("SELECT count(*) FROM patient WHERE id = 'loaded'", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(remaining, 0);
+
     db.drop().await;
 }
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL 18; set FHIRPG_TEST_DB"]
-async fn witness_x15_procedures_interpolate_the_resource_type_unquoted() {
-    // Defect X15, the stored-procedure twin of X2. Every procedure builds SQL
-    // with `format('%s', resource_type)` rather than `%I`, so:
+async fn x15_reserved_word_resource_types_work_through_the_procedures() {
+    // Defect X15, fixed by T11c.
     //
-    //   * a resource type that lowercases to a reserved word is unusable —
-    //     FHIR's `Group` is exactly that; and
-    //   * the value, which comes from resource content, is concatenated into a
-    //     string that `EXECUTE` runs.
+    // Before: every procedure built SQL with `format('%s', resource_type)`, so
+    // FHIR's `Group` -- whose table name is a PostgreSQL reserved word -- made
+    // `fhirpg_create` and `fhirpg_read` fail with a syntax error, and
+    // resource-derived data was concatenated into a string `EXECUTE` runs.
+    //
+    // Now every identifier goes through `%I`. Note `%I` preserves case while
+    // the unquoted `%s` folded to lower case, so the table name is lowered
+    // explicitly before quoting -- the resourceType VALUE keeps its own case.
     let Some((db, client)) = initialized("x15").await else {
         return;
     };
 
-    // The tables exist and are writable when quoted (asserted in T11's suite),
-    // so the failure is entirely the procedure's unquoted interpolation.
-    let err = client
+    let created = call(
+        &client,
+        r#"SELECT fhirpg_create('{"resourceType":"Group","id":"g1"}'::jsonb)"#,
+    )
+    .await;
+    assert_eq!(created["resourceType"], "Group", "case must be preserved");
+    assert_eq!(created["id"], "g1");
+
+    let read = call(&client, "SELECT fhirpg_read('Group','g1')").await;
+    assert_eq!(read["id"], "g1");
+
+    let deleted = call(&client, "SELECT fhirpg_delete('Group','g1')").await;
+    assert_eq!(deleted["id"], "g1");
+
+    let archived: i64 = client
         .query_one(
-            r#"SELECT fhirpg_create('{"resourceType":"Group","id":"g1"}'::jsonb)"#,
+            "SELECT count(*) FROM group_history WHERE id = 'g1' AND status = 'deleted'",
             &[],
         )
         .await
-        .expect_err("X15 is fixed — flip this witness");
-    let message = describe(&err);
-    assert!(message.contains("syntax error"), "{message}");
-    assert!(message.contains("Group"), "the unquoted type reaches the SQL: {message}");
+        .unwrap()
+        .get(0);
+    assert_eq!(archived, 1);
 
-    let err = client
-        .query_one("SELECT fhirpg_read('Group','g1')", &[])
-        .await
-        .expect_err("X15 is fixed — flip this witness");
-    assert!(describe(&err).contains("syntax error"), "{}", describe(&err));
-
-    // And the untrusted value really does reach the executed statement.
-    //
-    // `fhirpg_read` builds `SELECT … FROM %s r WHERE r.id = $1`. Feeding it
-    // `patient r2, pg_class WHERE false; --` yields
-    // `FROM patient r2, pg_class WHERE false; -- r`, so the injected text has
-    // introduced a join, a predicate, and commented out the query's own alias
-    // — hence "missing FROM-clause entry for table r". The structure of the
-    // executed query was changed by resource-derived data, which is the whole
-    // of the finding.
-    //
-    // We assert the mechanism, not a working exploit. Whether a payload can be
-    // crafted that stays syntactically valid at all four interpolation sites is
-    // beside the point: the fix is `%I` either way.
+    // And an identifier that is not a known table is now a missing-relation
+    // error, not a query whose structure the input changed.
     let err = client
         .query_one(
             "SELECT fhirpg_read('patient r2, pg_class WHERE false; --', 'x')",
             &[],
         )
         .await
-        .expect_err("X15 is fixed — flip this witness");
+        .expect_err("an unknown resource type must still fail");
     let message = describe(&err);
     assert!(
-        message.contains("missing FROM-clause entry")
-            || message.contains("syntax error")
-            || message.contains("pg_class"),
-        "the injected text did not reach the query: {message}"
+        message.contains("does not exist"),
+        "the value must be treated as one identifier, not as SQL: {message}"
     );
 
     db.drop().await;
@@ -504,9 +528,6 @@ async fn d13_concurrency() {
         .collect();
 
     // The question D13 turns on: was A's committed version (v = 2) archived?
-    //
-    // If v = 2 is missing, the race is real: B replaced A's row but archived
-    // the pre-A version, so A's version is lost from history entirely.
     let race_reproduced = !archived_versions.contains(&2);
 
     println!(
@@ -514,14 +535,25 @@ async fn d13_concurrency() {
          race_reproduced = {race_reproduced}"
     );
 
-    // Recorded either way. This assertion documents the outcome that was
-    // actually observed; see spec §2.4 and plan.md D13.
+    // Against the faithfully translated procedures this assertion was inverted
+    // and it PASSED: history held only [1], so A's committed v=2 was lost
+    // entirely. That is what promoted D13 from a simplification to a
+    // correctness fix (see plan.md D13 and spec §2.4).
+    //
+    // With the RETURNING OLD rewrite the pre-image comes from the same
+    // statement that replaces the row, so it cannot disagree with what was
+    // replaced. Both of A's and B's versions must now be accounted for.
     assert!(
-        race_reproduced,
-        "The stale-pre-image race did NOT reproduce: A's version (v=2) was \
-         archived correctly as {archived_versions:?}. D13's correctness \
-         justification does not hold and must be downgraded to a \
-         simplification-only change in plan.md and spec §2.4."
+        !race_reproduced,
+        "The stale-pre-image race is back: A committed v=2 and B replaced it, \
+         but history holds {archived_versions:?}. The RETURNING OLD rewrite \
+         (D13) has regressed."
+    );
+    assert_eq!(
+        archived_versions,
+        vec![2],
+        "exactly A's committed version should be archived; v=1 never was, \
+         because A replaced it with a raw UPDATE that bypasses the procedures"
     );
 
     db.drop().await;

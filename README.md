@@ -127,9 +127,13 @@ spec defines what fhirpg guarantees and what the deployment must provide.
 
 ## Documentation
 
+- **[The book](book/src/SUMMARY.md)** — getting started, the storage
+  model, querying, search, the REST API, operations, architecture.
 - [`spec/index.md`](spec/index.md) — the normative specification.
 - [`plan.md`](plan.md) — design decisions, risks, milestones.
 - [`tasks.md`](tasks.md) — the implementation work breakdown.
+- [`doc/benchmarks.md`](doc/benchmarks.md) — measured performance.
+- [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 

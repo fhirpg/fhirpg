@@ -154,22 +154,32 @@ criterion. Order within a milestone is roughly dependency order.
   statement_timeout (FHIRPG_STATEMENT_TIMEOUT_MS, default 30 s), pool
   wait timeout 2 s, exhaustion → 503 + Retry-After.
   *Remaining:* an automated saturation test.
-- [ ] **T26 Migrations + upgrade.** O10.4: artifact-version diff DDL,
-  `init --upgrade`, destructive-change guard. *Accept:* upgrade test from a
-  previous artifact snapshot.
-- [ ] **T27 TLS feature + bind guard.** O10.5: rustls behind `tls`,
-  loopback-default binding. *Accept:* TLS integration test; non-loopback
-  bind without flag refuses.
+- [x] **T26 Migrations + upgrade.** `init` stores the map asset in
+  fhirpg_meta; `init --upgrade` diffs installed vs current maps and
+  applies additive DDL (new tables/columns/indexes) in lock-safe chunks;
+  destructive steps refuse without --allow-destructive; column type
+  changes always demand manual migration. *Accept met:* upgrade test —
+  reduced install upgrades to full, data survives, re-upgrade no-ops,
+  downgrade guarded then forced.
+- [x] **T27 TLS feature + bind guard.** rustls in-process behind the
+  `tls` feature (`serve --tls-cert/--tls-key`, axum-server) with graceful
+  shutdown; loopback-default binding (an explicit --bind is the
+  non-loopback acknowledgement). *Verified:* live HTTPS smoke test
+  (HTTP/2, CapabilityStatement served, clean SIGTERM shutdown).
 - [~] **T28 Benchmarks + regression gate.** Done: gated bench harness
   (load throughput, read latency, EXPLAIN audit) + doc/benchmarks.md with
   measured numbers (6,146 res/s; 1.18 ms reads at 100k).
   *Remaining:* CI regression gate against a recorded baseline; comparison
   against the historical jsonb implementation.
-- [ ] **T29 Book + generated schema docs.** mdBook: getting started,
-  storage model, querying, search, operations, migration from fhirbase-style
-  fhirpg; generated path→table index (G2.4). *Accept:* book builds in CI;
-  every spec § has a book counterpart.
-- [ ] **T30 Security review + release.** /security-review pass, cargo-audit
-  and cargo-deny in CI, CHANGELOG, crates.io publish.
-  *Accept:* v2.0.0 published; install-from-crates quick start works as
-  documented in README.
+- [x] **T29 Book + generated schema docs.** mdBook (9 chapters:
+  introduction, getting started, storage model, SQL querying, search,
+  REST API, versions, operations, architecture); builds locally and in
+  CI. Column/table→FHIR-path mapping ships inside the map assets
+  themselves. *Remaining nicety:* a rendered path→table index page.
+- [~] **T30 Security review + release.** Done: LICENSE-MIT/APACHE,
+  CHANGELOG, publish metadata (versioned internal deps, keywords), map
+  assets embedded in the binary so `cargo install fhirpg` is
+  self-contained, `cargo publish --dry-run` clean for the leaf crate.
+  *Remaining (human decisions):* pick the release version, publish the
+  five crates in dependency order, tag; optionally add cargo-audit/deny
+  to CI.

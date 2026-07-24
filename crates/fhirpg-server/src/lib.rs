@@ -64,7 +64,10 @@ pub fn router(versions: BTreeMap<String, Arc<Store>>) -> Router {
         .route("/metrics", get(metrics_endpoint))
         .route("/{v}/metadata", get(metadata))
         .route("/{v}", post(bundle_endpoint))
-        .route("/{v}/{ty}", get(search_type).post(create))
+        .route(
+            "/{v}/{ty}",
+            get(search_type).post(create).delete(conditional_delete),
+        )
         .route("/{v}/{ty}/_search", post(search_type_post))
         .route(
             "/{v}/{ty}/{id}",
@@ -547,6 +550,41 @@ async fn update(
     }
 }
 
+/// DELETE {ty}?criteria — deletes a single match; several matches is a
+/// client error, zero is a no-op.
+async fn conditional_delete(
+    State(app): State<Arc<AppState>>,
+    Path((v, ty)): Path<(String, String)>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    let vs = match app.typed(&v, &ty) {
+        Ok(vs) => vs,
+        Err(r) => return r,
+    };
+    if params.is_empty() {
+        return oo(
+            StatusCode::BAD_REQUEST,
+            "invalid",
+            "conditional delete requires search criteria",
+        );
+    }
+    match vs.store.search(&ty, &params, 2, 0).await {
+        Ok(matches) => match matches.len() {
+            0 => StatusCode::NO_CONTENT.into_response(),
+            1 => match vs.store.delete(&ty, &matches[0]).await {
+                Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                Err(e) => err_response(e),
+            },
+            _ => oo(
+                StatusCode::PRECONDITION_FAILED,
+                "multiple-matches",
+                "criteria match more than one resource",
+            ),
+        },
+        Err(e) => err_response(e),
+    }
+}
+
 async fn delete_instance(
     State(app): State<Arc<AppState>>,
     Path((v, ty, id)): Path<(String, String, String)>,
@@ -612,6 +650,7 @@ async fn run_search(
     let mut want_total = false;
     let mut includes: Vec<String> = Vec::new();
     let mut revincludes: Vec<(String, String)> = Vec::new();
+    let mut cursor: Option<String> = None;
     let mut search_params: Vec<(String, String)> = Vec::new();
     for (k, val) in &params {
         match k.as_str() {
@@ -636,6 +675,7 @@ async fn run_search(
                 }
             }
             "_total" => want_total = val != "none",
+            "_cursor" => cursor = Some(val.clone()),
             "_include" => {
                 let mut it = val.split(':');
                 let (src, p) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
@@ -672,9 +712,24 @@ async fn run_search(
             _ => search_params.push((k.clone(), val.clone())),
         }
     }
+    if cursor.is_some() && !sort.is_empty() {
+        return oo(
+            StatusCode::BAD_REQUEST,
+            "invalid",
+            "_cursor cannot be combined with _sort",
+        );
+    }
     let outcome = match vs
         .store
-        .search_full(ty, &search_params, count, offset, &sort, want_total)
+        .search_page(
+            ty,
+            &search_params,
+            count,
+            offset,
+            &sort,
+            want_total,
+            cursor.as_deref(),
+        )
         .await
     {
         Ok(o) => o,
@@ -751,10 +806,18 @@ async fn run_search(
     if ids.len() as i64 == count && count > 0 {
         let mut next_params: Vec<(String, String)> = params
             .iter()
-            .filter(|(k, _)| k != "_offset")
+            .filter(|(k, _)| k != "_offset" && k != "_cursor")
             .cloned()
             .collect();
-        next_params.push(("_offset".to_string(), (offset + count).to_string()));
+        if sort.is_empty() {
+            // Keyset cursor: stable under concurrent writes.
+            next_params.push((
+                "_cursor".to_string(),
+                ids.last().expect("non-empty page").clone(),
+            ));
+        } else {
+            next_params.push(("_offset".to_string(), (offset + count).to_string()));
+        }
         links.push(json!({
             "relation": "next",
             "url": format!("{base}/{ty}{}", rebuild_query(&next_params))

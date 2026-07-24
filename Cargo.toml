@@ -10,16 +10,18 @@ members = [
 
 [workspace.package]
 version = "2.0.0-dev"
+keywords = ["fhir", "healthcare", "postgresql", "hl7", "medical"]
+categories = ["database", "science", "command-line-utilities"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/joelparkerhenderson/fhirpg"
 rust-version = "1.90"
 
 [workspace.dependencies]
-fhirpg-map = { path = "crates/fhirpg-map" }
-fhirpg-gen = { path = "crates/fhirpg-gen" }
-fhirpg-store = { path = "crates/fhirpg-store" }
-fhirpg-server = { path = "crates/fhirpg-server" }
+fhirpg-map = { path = "crates/fhirpg-map", version = "2.0.0-dev" }
+fhirpg-gen = { path = "crates/fhirpg-gen", version = "2.0.0-dev" }
+fhirpg-store = { path = "crates/fhirpg-store", version = "2.0.0-dev" }
+fhirpg-server = { path = "crates/fhirpg-server", version = "2.0.0-dev" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
 thiserror = "2"

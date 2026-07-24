@@ -5,7 +5,7 @@
 //! value is bound as a parameter — nothing user-supplied is interpolated
 //! into SQL text.
 
-use fhirpg_map::model::{ResourceMap, SearchDef, TargetKind};
+use fhirpg_map::model::{RelMap, ResourceMap, SearchDef, TargetKind};
 
 use crate::StoreError;
 
@@ -13,6 +13,9 @@ pub struct CompiledQuery {
     pub sql: String,
     /// Same WHERE clause, counting instead of selecting (for _total).
     pub count_sql: String,
+    /// How many leading binds `count_sql` uses (cursor/limit/offset binds
+    /// belong only to the page query).
+    pub count_binds: usize,
     pub binds: Vec<String>,
 }
 
@@ -60,13 +63,15 @@ fn sort_col(rm: &ResourceMap, key: &SortKey) -> Result<String, StoreError> {
 /// Build `SELECT id FROM base WHERE …` for raw query parameters
 /// (`name` or `name:modifier` → comma-separated values).
 pub fn build_search_sql(
-    schema: &str,
+    map: &RelMap,
     rm: &ResourceMap,
     params: &[(String, String)],
     count: i64,
     offset: i64,
     sort: &[SortKey],
+    after_id: Option<&str>,
 ) -> Result<CompiledQuery, StoreError> {
+    let schema = map.schema.as_str();
     let base = &rm.base_table().name;
     let from = format!("FROM \"{schema}\".\"{base}\" p");
     let mut sql = format!("SELECT p.\"id\" {from}");
@@ -74,11 +79,8 @@ pub fn build_search_sql(
     let mut binds: Vec<String> = Vec::new();
 
     for (rawname, value) in params {
-        let (name, modifier) = match rawname.split_once(':') {
-            Some((n, m)) => (n, Some(m)),
-            None => (rawname.as_str(), None),
-        };
-        if name == "_id" {
+        let name = rawname.split([':', '.']).next().unwrap_or(rawname);
+        if name == "_id" && !rawname.contains('.') {
             let ors: Vec<String> = value
                 .split(',')
                 .map(|v| {
@@ -97,41 +99,28 @@ pub fn build_search_sql(
             wheres.push(format!("({})", ors.join(" OR ")));
             continue;
         }
-        let Some(def) = rm.search.iter().find(|d| d.code == name) else {
-            return Err(StoreError::Other(format!(
-                "unsupported search parameter {name:?}"
-            )));
-        };
-        if def.targets.is_empty() {
-            return Err(StoreError::Other(format!(
-                "search parameter {name:?} is not supported: {}",
-                def.note.as_deref().unwrap_or("no targets")
-            )));
-        }
-        let mut ors: Vec<String> = Vec::new();
-        for v in value.split(',') {
-            for t in &def.targets {
-                let pred = target_pred(def, t, v, modifier, &mut binds)?;
-                let tname = &rm.tables[t.table as usize].name;
-                if t.table == 0 {
-                    ors.push(pred.replace("«c»", "p"));
-                } else {
-                    ors.push(format!(
-                        "EXISTS (SELECT 1 FROM \"{schema}\".\"{tname}\" c WHERE c.\"rid\" = p.\"id\" AND {})",
-                        pred.replace("«c»", "c")
-                    ));
-                }
-            }
-        }
-        wheres.push(format!("({})", ors.join(" OR ")));
+        wheres.push(param_predicate(
+            map, rm, "p", rawname, value, &mut binds, 0,
+        )?);
     }
-
+    // _total counts every match; the keyset cursor narrows only the page
+    // query, so it is appended after the count SQL is fixed.
     let mut where_clause = String::new();
     if !wheres.is_empty() {
         where_clause = format!(" WHERE {}", wheres.join(" AND "));
-        sql.push_str(&where_clause);
     }
     let count_sql = format!("SELECT count(*) {from}{where_clause}");
+    let count_binds = binds.len();
+    if let Some(after) = after_id {
+        binds.push(after.to_string());
+        let pred = format!("p.\"id\" > ${}", binds.len());
+        where_clause = if where_clause.is_empty() {
+            format!(" WHERE {pred}")
+        } else {
+            format!("{where_clause} AND {pred}")
+        };
+    }
+    sql.push_str(&where_clause);
     let mut order: Vec<String> = Vec::new();
     for key in sort {
         let col = sort_col(rm, key)?;
@@ -149,8 +138,120 @@ pub fn build_search_sql(
     Ok(CompiledQuery {
         sql,
         count_sql,
+        count_binds,
         binds,
     })
+}
+
+/// The predicate for one raw (name, value) query parameter at `alias`,
+/// including single-hop chained references (`subject:Patient.name=x`).
+fn param_predicate(
+    map: &RelMap,
+    rm: &ResourceMap,
+    alias: &str,
+    rawname: &str,
+    value: &str,
+    binds: &mut Vec<String>,
+    depth: usize,
+) -> Result<String, StoreError> {
+    let schema = map.schema.as_str();
+    // Chain: "refparam[:Type].rest…" — resolve the reference, then apply
+    // the rest of the chain to the referenced type.
+    if let Some((head, rest)) = rawname.split_once('.') {
+        if depth >= 1 {
+            return Err(StoreError::Other(
+                "reference chains deeper than one hop are not supported".into(),
+            ));
+        }
+        let (refname, target_type) = match head.split_once(':') {
+            Some((n, t)) => (n, Some(t)),
+            None => (head, None),
+        };
+        let Some(target_type) = target_type else {
+            return Err(StoreError::Other(format!(
+                "chained parameter {head:?} needs an explicit type: {refname}:Type.{rest}"
+            )));
+        };
+        let Some(def) = rm.search.iter().find(|d| d.code == refname) else {
+            return Err(StoreError::Other(format!(
+                "unsupported search parameter {refname:?}"
+            )));
+        };
+        let Some(target_rm) = map.resources.get(target_type) else {
+            return Err(StoreError::Other(format!(
+                "unknown chain target type {target_type:?}"
+            )));
+        };
+        let tbase = &target_rm.base_table().name;
+        let mut ors = Vec::new();
+        for t in &def.targets {
+            let TargetKind::Reference { c_type, c_id, .. } = &t.kind else {
+                continue;
+            };
+            let d = depth;
+            let (ref_alias, wrap) = if t.table == 0 {
+                (alias.to_string(), None)
+            } else {
+                let tname = &rm.tables[t.table as usize].name;
+                (
+                    format!("c{d}"),
+                    Some(format!(
+                        "EXISTS (SELECT 1 FROM \"{schema}\".\"{tname}\" c{d}                          WHERE c{d}.\"rid\" = {alias}.\"id\" AND "
+                    )),
+                )
+            };
+            binds.push(target_type.to_string());
+            let ty_bind = binds.len();
+            let t_alias = format!("t{d}");
+            let inner = param_predicate(map, target_rm, &t_alias, rest, value, binds, depth + 1)?;
+            let core = format!(
+                "({ref_alias}.\"{c_type}\" = ${ty_bind} AND EXISTS (SELECT 1 FROM                  \"{schema}\".\"{tbase}\" {t_alias} WHERE {t_alias}.\"id\" =                  {ref_alias}.\"{c_id}\" AND {inner}))"
+            );
+            match wrap {
+                Some(w) => ors.push(format!("{w}{core})")),
+                None => ors.push(core),
+            }
+        }
+        if ors.is_empty() {
+            return Err(StoreError::Other(format!(
+                "{refname:?} is not a reference parameter"
+            )));
+        }
+        return Ok(format!("({})", ors.join(" OR ")));
+    }
+
+    let (name, modifier) = match rawname.split_once(':') {
+        Some((n, m)) => (n, Some(m)),
+        None => (rawname, None),
+    };
+    let Some(def) = rm.search.iter().find(|d| d.code == name) else {
+        return Err(StoreError::Other(format!(
+            "unsupported search parameter {name:?}"
+        )));
+    };
+    if def.targets.is_empty() {
+        return Err(StoreError::Other(format!(
+            "search parameter {name:?} is not supported: {}",
+            def.note.as_deref().unwrap_or("no targets")
+        )));
+    }
+    let mut ors: Vec<String> = Vec::new();
+    for v in value.split(',') {
+        for t in &def.targets {
+            let pred = target_pred(def, t, v, modifier, binds)?;
+            let tname = &rm.tables[t.table as usize].name;
+            if t.table == 0 {
+                ors.push(pred.replace("«c»", alias));
+            } else {
+                let ca = format!("c{depth}x");
+                ors.push(format!(
+                    "EXISTS (SELECT 1 FROM \"{schema}\".\"{tname}\" {ca} WHERE {ca}.\"rid\" = {alias}.\"id\" AND {})",
+                    pred.replace("«c»", &ca)
+                ));
+            }
+        }
+    }
+    Ok(format!("({})", ors.join(" OR ")))
 }
 
 /// One predicate for one target and one value. Column references use the

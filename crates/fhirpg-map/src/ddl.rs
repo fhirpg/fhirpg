@@ -44,7 +44,7 @@ pub fn ddl_in(map: &RelMap, schema: &str) -> Vec<String> {
 /// One index per distinct search-target column set (P6.4). Index names share
 /// the relation namespace with tables, so they get a `_ix` suffix and the
 /// same 63-byte discipline.
-fn search_indexes(schema: &str, rm: &ResourceMap) -> Vec<String> {
+pub fn search_indexes(schema: &str, rm: &ResourceMap) -> Vec<String> {
     use crate::model::TargetKind;
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
@@ -97,7 +97,7 @@ fn index_name(table: &str, cols: &[&str]) -> String {
     format!("{keep}_{hex}")
 }
 
-fn create_table(schema: &str, rm: &ResourceMap, t: &Table) -> String {
+pub fn create_table(schema: &str, rm: &ResourceMap, t: &Table) -> String {
     let base = &rm.base_table().name;
     let mut sql = format!("CREATE TABLE \"{schema}\".\"{}\" (\n", t.name);
     match t.kind {

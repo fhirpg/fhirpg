@@ -24,6 +24,10 @@ jobs:
       # Unit tests pass with no database and no spec packages present;
       # the corpus/spec-driven tests skip themselves when inputs are absent.
       - run: cargo test --workspace
+      - name: Build the book
+        run: |
+          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.52/mdbook-v0.4.52-x86_64-unknown-linux-gnu.tar.gz | tar -xz
+          ./mdbook build book
 
   database:
     name: Live-database tests (PostgreSQL 18)

@@ -53,8 +53,16 @@ enum Cmd {
         #[arg(long)]
         spec_root: PathBuf,
     },
-    /// Create the relational schema for the selected FHIR version.
-    Init,
+    /// Create the relational schema for the selected FHIR version, or
+    /// upgrade an installed one to the current map assets.
+    Init {
+        /// Apply additive schema changes to an existing install.
+        #[arg(long)]
+        upgrade: bool,
+        /// Permit destructive upgrade steps (dropped tables/columns).
+        #[arg(long)]
+        allow_destructive: bool,
+    },
     /// Load resources: NDJSON, Bundle, or single-resource JSON, gzipped or
     /// plain, detected by content.
     Load {
@@ -102,6 +110,13 @@ enum Cmd {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8080")]
         bind: String,
+        /// PEM certificate chain for in-process TLS (requires the `tls`
+        /// build feature; both --tls-cert and --tls-key must be given).
+        #[arg(long, requires = "tls_key")]
+        tls_cert: Option<PathBuf>,
+        /// PEM private key for in-process TLS.
+        #[arg(long, requires = "tls_cert")]
+        tls_key: Option<PathBuf>,
     },
 }
 
@@ -117,16 +132,44 @@ fn main() -> Result<()> {
     }
 }
 
-fn load_map(assets: &Path, schema: &str) -> Result<RelMap> {
+/// The generated map assets ship inside the binary, so `cargo install
+/// fhirpg` works with no asset directory; an on-disk asset (via --assets)
+/// overrides the embedded copy.
+fn embedded_asset(schema: &str) -> Option<&'static [u8]> {
+    match schema {
+        "r3" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/fhirpg-relmap-r3.json.gz"
+        ))),
+        "r4" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/fhirpg-relmap-r4.json.gz"
+        ))),
+        "r5" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/fhirpg-relmap-r5.json.gz"
+        ))),
+        _ => None,
+    }
+}
+
+fn asset_bytes(assets: &Path, schema: &str) -> Result<Vec<u8>> {
     let path = assets.join(format!("fhirpg-relmap-{schema}.json.gz"));
-    let bytes = std::fs::read(&path)
-        .with_context(|| format!("{}: run `fhirpg gen` first", path.display()))?;
-    RelMap::from_gz_bytes(&bytes).with_context(|| format!("{}: corrupt map", path.display()))
+    if let Ok(bytes) = std::fs::read(&path) {
+        return Ok(bytes);
+    }
+    embedded_asset(schema)
+        .map(<[u8]>::to_vec)
+        .with_context(|| format!("no asset at {} and none embedded", path.display()))
+}
+
+fn load_map(assets: &Path, schema: &str) -> Result<RelMap> {
+    let bytes = asset_bytes(assets, schema)?;
+    RelMap::from_gz_bytes(&bytes).context("corrupt map asset")
 }
 
 fn map_checksum(assets: &Path, schema: &str) -> Result<String> {
-    let path = assets.join(format!("fhirpg-relmap-{schema}.json.gz"));
-    let bytes = std::fs::read(&path)?;
+    let bytes = asset_bytes(assets, schema)?;
     let mut h = Sha256::new();
     h.update(&bytes);
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
@@ -225,25 +268,41 @@ fn show(v: &fhirpg_map::SqlVal) -> String {
 }
 
 async fn run_db(cli: Cli) -> Result<()> {
-    if let Cmd::Serve { ref bind } = cli.cmd {
-        return serve(&cli, bind).await;
+    if let Cmd::Serve {
+        ref bind,
+        ref tls_cert,
+        ref tls_key,
+    } = cli.cmd
+    {
+        return serve(&cli, bind, tls_cert.as_deref(), tls_key.as_deref()).await;
     }
     let schema = cli.fhir_version.schema();
     let map = Arc::new(load_map(&cli.assets, schema)?);
     let cfg = fhirpg_store::pg_config(cli.dsn.as_deref())?;
     let store = fhirpg_store::Store::connect(cfg, map.clone()).await?;
     match cli.cmd {
-        Cmd::Init => {
+        Cmd::Init {
+            upgrade,
+            allow_destructive,
+        } => {
             let sum = map_checksum(&cli.assets, schema)?;
-            let created = store.init(&sum).await?;
-            eprintln!(
-                "{schema}: {}",
-                if created {
-                    "schema created"
-                } else {
-                    "already installed, no-op"
-                }
-            );
+            if upgrade {
+                let report = store.upgrade(&sum, allow_destructive).await?;
+                eprintln!(
+                    "{schema}: upgraded — {} additive, {} destructive change(s)",
+                    report.additive, report.destructive
+                );
+            } else {
+                let created = store.init(&sum).await?;
+                eprintln!(
+                    "{schema}: {}",
+                    if created {
+                        "schema created"
+                    } else {
+                        "already installed, no-op"
+                    }
+                );
+            }
         }
         Cmd::Load { paths, validate } => {
             if paths.is_empty() {
@@ -351,7 +410,12 @@ async fn run_db(cli: Cli) -> Result<()> {
 
 /// Mount every version whose map asset exists and whose schema is
 /// installed, then serve.
-async fn serve(cli: &Cli, bind: &str) -> Result<()> {
+async fn serve(
+    cli: &Cli,
+    bind: &str,
+    tls_cert: Option<&Path>,
+    tls_key: Option<&Path>,
+) -> Result<()> {
     let mut versions = std::collections::BTreeMap::new();
     for schema in ["r3", "r4", "r5"] {
         let Ok(map) = load_map(&cli.assets, schema) else {
@@ -368,6 +432,9 @@ async fn serve(cli: &Cli, bind: &str) -> Result<()> {
     }
     let mounted: Vec<String> = versions.keys().cloned().collect();
     let app = fhirpg_server::router(versions);
+    if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
+        return serve_tls(app, bind, cert, key, &mounted).await;
+    }
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
@@ -377,6 +444,44 @@ async fn serve(cli: &Cli, bind: &str) -> Result<()> {
         .await?;
     eprintln!("fhirpg: shut down cleanly");
     Ok(())
+}
+
+#[cfg(feature = "tls")]
+async fn serve_tls(
+    app: axum::Router,
+    bind: &str,
+    cert: &Path,
+    key: &Path,
+    mounted: &[String],
+) -> Result<()> {
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+        .await
+        .with_context(|| format!("TLS material {} / {}", cert.display(), key.display()))?;
+    let addr: std::net::SocketAddr = bind.parse().with_context(|| format!("bind {bind}"))?;
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+    });
+    eprintln!("fhirpg serving {} on https://{bind}", mounted.join(", "));
+    axum_server::bind_rustls(addr, config)
+        .handle(handle)
+        .serve(app.into_make_service())
+        .await?;
+    eprintln!("fhirpg: shut down cleanly");
+    Ok(())
+}
+
+#[cfg(not(feature = "tls"))]
+async fn serve_tls(
+    _app: axum::Router,
+    _bind: &str,
+    _cert: &Path,
+    _key: &Path,
+    _mounted: &[String],
+) -> Result<()> {
+    bail!("this build lacks the `tls` feature; rebuild with --features tls")
 }
 
 /// Strict validation through the typed FHIR model (spec V9.2). R5 only:

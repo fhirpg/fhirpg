@@ -51,6 +51,29 @@ pub struct PutOutcome {
 }
 
 #[derive(Debug)]
+pub struct UpgradeReport {
+    pub additive: usize,
+    pub destructive: usize,
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>, StoreError> {
+    if !s.len().is_multiple_of(2) {
+        return Err(StoreError::Other("bad hex asset".into()));
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16)
+                .map_err(|_| StoreError::Other("bad hex asset".into()))
+        })
+        .collect()
+}
+
+#[derive(Debug)]
 pub struct SearchOutcome {
     pub ids: Vec<String>,
     pub total: Option<i64>,
@@ -219,19 +242,162 @@ impl Store {
             tx.batch_execute(&chunk.join(";\n")).await?;
             tx.commit().await?;
         }
+        let asset_hex = hex_encode(
+            &self
+                .map
+                .to_gz_bytes()
+                .map_err(|e| StoreError::Other(e.to_string()))?,
+        );
         client
             .execute(
                 &format!(
                     "INSERT INTO \"{staging}\".\"fhirpg_meta\" (\"key\", \"value\") \
-                     VALUES ('map_checksum', $1), ('fhir_version', $2)"
+                     VALUES ('map_checksum', $1), ('fhir_version', $2), ('map_asset', $3)"
                 ),
-                &[&checksum, &self.map.fhir_version.as_str()],
+                &[&checksum, &self.map.fhir_version.as_str(), &asset_hex],
             )
             .await?;
         client
             .batch_execute(&format!("ALTER SCHEMA \"{staging}\" RENAME TO \"{s}\""))
             .await?;
         Ok(true)
+    }
+
+    /// Upgrade an installed schema to this store's map: additive changes
+    /// (new tables, new columns, new indexes) apply automatically;
+    /// destructive ones (dropped tables/columns/indexes) require
+    /// `allow_destructive`. Column type changes always refuse — those need
+    /// a manual migration.
+    pub async fn upgrade(
+        &self,
+        checksum: &str,
+        allow_destructive: bool,
+    ) -> Result<UpgradeReport, StoreError> {
+        let s = &self.map.schema;
+        let mut client = self.pool.get().await?;
+        let old_hex: String = client
+            .query_opt(
+                &format!(
+                    "SELECT \"value\" FROM \"{s}\".\"fhirpg_meta\" WHERE \"key\" = 'map_asset'"
+                ),
+                &[],
+            )
+            .await
+            .map_err(|_| StoreError::Other(format!("schema {s} is not installed")))?
+            .ok_or_else(|| {
+                StoreError::Other(
+                    "installed schema predates upgrade support (no stored map asset)".into(),
+                )
+            })?
+            .get(0);
+        let old_bytes = hex_decode(&old_hex)?;
+        let old_map = RelMap::from_gz_bytes(&old_bytes)
+            .map_err(|e| StoreError::Other(format!("stored map asset unreadable: {e}")))?;
+
+        // Diff tables and columns by name across all resources.
+        use std::collections::HashMap;
+        let mut adds: Vec<String> = Vec::new();
+        let mut destructive: Vec<String> = Vec::new();
+        let mut old_tables: HashMap<&str, &fhirpg_map::model::Table> = HashMap::new();
+        for rm in old_map.resources.values() {
+            for t in &rm.tables {
+                old_tables.insert(t.name.as_str(), t);
+            }
+        }
+        let mut new_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for rm in self.map.resources.values() {
+            for t in &rm.tables {
+                new_names.insert(t.name.as_str());
+                match old_tables.get(t.name.as_str()) {
+                    None => adds.push(fhirpg_map::ddl::create_table(s, rm, t)),
+                    Some(old_t) => {
+                        let old_cols: HashMap<&str, ColTy> =
+                            old_t.cols.iter().map(|c| (c.name.as_str(), c.ty)).collect();
+                        let new_col_names: std::collections::HashSet<&str> =
+                            t.cols.iter().map(|c| c.name.as_str()).collect();
+                        for c in &t.cols {
+                            match old_cols.get(c.name.as_str()) {
+                                None => adds.push(format!(
+                                    "ALTER TABLE \"{s}\".\"{}\" ADD COLUMN \"{}\" {}",
+                                    t.name,
+                                    c.name,
+                                    fhirpg_map::ddl::col_sql(c.ty)
+                                )),
+                                Some(old_ty) if *old_ty != c.ty => {
+                                    return Err(StoreError::Other(format!(
+                                        "column {}.{} changed type {:?} → {:?}; manual migration required",
+                                        t.name, c.name, old_ty, c.ty
+                                    )));
+                                }
+                                Some(_) => {}
+                            }
+                        }
+                        for name in old_cols.keys() {
+                            if !new_col_names.contains(name) {
+                                destructive.push(format!(
+                                    "ALTER TABLE \"{s}\".\"{}\" DROP COLUMN \"{name}\"",
+                                    t.name
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for name in old_tables.keys() {
+            if !new_names.contains(name) {
+                destructive.push(format!("DROP TABLE \"{s}\".\"{name}\" CASCADE"));
+            }
+        }
+        // Index diff by full statement text.
+        let old_ix: std::collections::HashSet<String> = old_map
+            .resources
+            .values()
+            .flat_map(|rm| fhirpg_map::ddl::search_indexes(s, rm))
+            .collect();
+        for rm in self.map.resources.values() {
+            for stmt in fhirpg_map::ddl::search_indexes(s, rm) {
+                if !old_ix.contains(&stmt) {
+                    adds.push(stmt);
+                }
+            }
+        }
+
+        if !destructive.is_empty() && !allow_destructive {
+            return Err(StoreError::Other(format!(
+                "upgrade requires {} destructive change(s); rerun with --allow-destructive (first: {})",
+                destructive.len(),
+                destructive.first().expect("non-empty")
+            )));
+        }
+        let all: Vec<&String> = adds.iter().chain(destructive.iter()).collect();
+        for chunk in all.chunks(100) {
+            let tx = client.transaction().await?;
+            let joined: Vec<String> = chunk.iter().map(|x| x.to_string()).collect();
+            tx.batch_execute(&joined.join(";\n")).await?;
+            tx.commit().await?;
+        }
+        let new_hex = hex_encode(
+            &self
+                .map
+                .to_gz_bytes()
+                .map_err(|e| StoreError::Other(e.to_string()))?,
+        );
+        client
+            .execute(
+                &format!(
+                    "UPDATE \"{s}\".\"fhirpg_meta\" SET \"value\" = CASE \"key\" \
+                     WHEN 'map_checksum' THEN $1 WHEN 'map_asset' THEN $2 \
+                     WHEN 'fhir_version' THEN $3 ELSE \"value\" END \
+                     WHERE \"key\" IN ('map_checksum', 'map_asset', 'fhir_version')"
+                ),
+                &[&checksum, &new_hex, &self.map.fhir_version.as_str()],
+            )
+            .await?;
+        Ok(UpgradeReport {
+            additive: adds.len(),
+            destructive: destructive.len(),
+        })
     }
 
     /// Remove this version's schema entirely (tables dropped in chunks to
@@ -680,17 +846,38 @@ impl Store {
         sort: &[search::SortKey],
         want_total: bool,
     ) -> Result<SearchOutcome, StoreError> {
+        self.search_page(rtype, params, count, offset, sort, want_total, None)
+            .await
+    }
+
+    /// Search with an optional keyset cursor (`after_id`) for stable
+    /// paging under the default id ordering.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_page(
+        &self,
+        rtype: &str,
+        params: &[(String, String)],
+        count: i64,
+        offset: i64,
+        sort: &[search::SortKey],
+        want_total: bool,
+        after_id: Option<&str>,
+    ) -> Result<SearchOutcome, StoreError> {
         let rm = self.rm(rtype)?;
-        let q = search::build_search_sql(&self.map.schema, rm, params, count, offset, sort)?;
+        let q = search::build_search_sql(&self.map, rm, params, count, offset, sort, after_id)?;
         let client = self.pool.get().await?;
         let refs: Vec<&(dyn ToSql + Sync)> =
             q.binds.iter().map(|b| b as &(dyn ToSql + Sync)).collect();
         let rows = client.query(&q.sql, &refs).await?;
         let ids = rows.iter().map(|r| r.get(0)).collect();
         let total = if want_total {
-            // The count query shares the WHERE binds but not LIMIT/OFFSET.
-            let n = refs.len() - 2;
-            Some(client.query_one(&q.count_sql, &refs[..n]).await?.get(0))
+            // The count query shares only the WHERE binds.
+            Some(
+                client
+                    .query_one(&q.count_sql, &refs[..q.count_binds])
+                    .await?
+                    .get(0),
+            )
         } else {
             None
         };

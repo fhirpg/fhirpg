@@ -412,6 +412,85 @@ async fn rest_api() {
     assert!(rmodes.contains(&("Patient", "match")), "{rmodes:?}");
     assert!(rmodes.contains(&("Observation", "include")), "{rmodes:?}");
 
+    // Chained reference search: Observations whose subject is a Patient
+    // with a given family name.
+    let (st, chained, _) = send(
+        &app,
+        "GET",
+        &format!("{b}/Observation?subject:Patient.family=TxnPatient"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{chained}");
+    assert_eq!(chained["entry"].as_array().unwrap().len(), 1, "{chained}");
+    // Untyped chain is an honest error, not a guess.
+    let (st, _, _) = send(
+        &app,
+        "GET",
+        &format!("{b}/Observation?subject.family=TxnPatient"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // Cursor paging: default ordering pages by keyset, not offset.
+    let (st, cpage, _) = send(
+        &app,
+        "GET",
+        &format!("{b}/Patient?family=Pager&_count=2"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let next = cpage["link"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["relation"] == "next")
+        .expect("next")["url"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(next.contains("_cursor="), "keyset expected: {next}");
+    let next_path = next.trim_start_matches("http://localhost").to_string();
+    let (st, cpage2, _) = send(&app, "GET", &next_path, None, &[]).await;
+    assert_eq!(st, StatusCode::OK);
+    let p1_ids: Vec<&str> = cpage["entry"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["resource"]["id"].as_str().unwrap())
+        .collect();
+    let p2_ids: Vec<&str> = cpage2["entry"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["resource"]["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        p1_ids.iter().all(|i| !p2_ids.contains(i)),
+        "{p1_ids:?} {p2_ids:?}"
+    );
+    assert_eq!(p2_ids.len(), 2);
+
+    // Conditional delete: several matches → 412; narrowed → deletes.
+    let (st, _, _) = send(
+        &app,
+        "DELETE",
+        &format!("{b}/Patient?family=Pager"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::PRECONDITION_FAILED);
+    let (st, _, _) = send(&app, "DELETE", &format!("{b}/Patient?_id=pg3"), None, &[]).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (st, _, _) = send(&app, "GET", &format!("{b}/Patient/pg3"), None, &[]).await;
+    assert_eq!(st, StatusCode::GONE);
+
     // poison transaction rolls everything back
     let (st, _, _) = send(
         &app,

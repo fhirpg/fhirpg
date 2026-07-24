@@ -1,1 +1,0 @@
-{"resourceType": "Immunization", "status": "completed", "patient": {"reference": "Patient/1"}, "occurrenceDateTime": "2020-01-01"}

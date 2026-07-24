@@ -1,1 +1,0 @@
-{"resourceType": "Group", "type": "person", "actual": true, "member": [{"entity": {"reference": "Patient/1"}}], "characteristic": [{"valueBoolean": true}, {"valueCodeableConcept": {"text": "t"}}]}

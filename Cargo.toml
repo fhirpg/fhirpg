@@ -1,70 +1,37 @@
 [workspace]
-members = ["xtask"]
-
-[package]
-name = "fhirpg"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.88"
-authors = ["Joel Parker Henderson <joel@joelparkerhenderson.com>"]
-description = "FHIR data in PostgreSQL working relationally."
-readme = "README.md"
-repository = "https://github.com/fhirpg/fhirpg/"
-license = "MIT OR Apache-2.0 OR GPL-2.0-only"
-keywords = ["fhir", "postgresql", "healthcare", "etl", "ndjson"]
-categories = ["command-line-utilities", "database", "science"]
-include = [
-    "/src/**",
-    "/assets/**",
-    "/README.md",
-    "/LICENSE.md",
-    "/CHANGELOG.md",
-    "/llms.txt",
+resolver = "3"
+members = [
+    "crates/fhirpg-map",
+    "crates/fhirpg-gen",
+    "crates/fhirpg-store",
+    "crates/fhirpg-server",
+    "crates/fhirpg",
 ]
 
-[features]
-# Check each resource against the typed FHIR R5 model while loading
-# (`--validate`). Off by default: it pulls in ~135k lines of generated Rust and
-# the loader is deliberately untyped otherwise (see AGENTS/architecture.md).
-validate = ["dep:fhir"]
+[workspace.package]
+version = "2.0.0-dev"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/joelparkerhenderson/fhirpg"
+rust-version = "1.90"
 
-[dependencies]
-clap = { version = "4.5", features = ["derive", "env", "wrap_help"] } # Command-line argument parser; `env` backs the libpq PG* variables (spec §6).
-thiserror = "2.0" # Derive macro for the typed error enum in `src/error.rs`.
-anyhow = "1.0" # Boundary error type: `main` only, never in library code.
-serde_json = { version = "1", features = ["preserve_order"] } # Parses the transform maps and carries resources through the load path as `Value`. `preserve_order` keeps object keys in insertion order, which is what shows web-console columns in SELECT order.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs"] } # Async runtime (decision D2); `signal` backs the web server's graceful shutdown.
-tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] } # PostgreSQL driver (D2); exposes COPY FROM STDIN, which the copy loader needs. The feature maps jsonb to serde_json::Value.
-native-tls = "0.2" # TLS backend. Chosen over rustls because its two danger switches map exactly onto libpq's four TLS sslmodes (spec §6).
-postgres-native-tls = "0.5" # Bridges native-tls to tokio-postgres.
-flate2 = "1" # gzip decoding; input compression is detected by content, not filename (spec §5.1).
-bytes = "1" # The buffer type tokio-postgres's COPY sink accepts.
-futures-util = { version = "0.3", default-features = false, features = ["sink"] } # SinkExt::send, for feeding the COPY sink.
-uuid = { version = "1.24", features = ["v7"] } # Client-side UUIDv7 for the copy loader, the third id-generation site (D12).
-indicatif = "0.17" # Progress bars, replacing fhirbase's vbauerster/mpb.
-reqwest = "0.12" # HTTP client for the Bulk Data API. Default TLS is native-tls, which the driver already pulls in; the gzip feature is deliberately OFF so downloads stay compressed on disk.
-tempfile = "3" # Scratch directory for Bulk Data downloads, removed on drop.
-axum = "0.8" # HTTP server for the web SQL console.
-deadpool-postgres = "0.14" # Connection pool for the web console (decision D2).
-serde = { version = "1", features = ["derive"] } # Deriving the web console's query-string extractor.
-fhir = { version = "1.2", default-features = false, features = ["r5"], optional = true }
+[workspace.dependencies]
+fhirpg-map = { path = "crates/fhirpg-map" }
+fhirpg-gen = { path = "crates/fhirpg-gen" }
+fhirpg-store = { path = "crates/fhirpg-store" }
+fhirpg-server = { path = "crates/fhirpg-server" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
+thiserror = "2"
+anyhow = "1"
+flate2 = "1"
+sha2 = "0.10"
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-[workspace.lints.rust]
-unsafe_code = "forbid"
-
-[workspace.lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-# Spec invariant 2: no code path reachable from input may panic. These lints
-# make that a mechanical check rather than a code-review promise.
-unwrap_used = "deny"
-expect_used = "deny"
-panic = "deny"
-
-[lints]
-workspace = true
-
-[dev-dependencies]
-proptest = "1" # Property-based tests for the transformation (spec §4.8).
-sha2 = "0.10" # Verifies that the vendored fhirbase assets are byte-identical (assets/CHECKSUMS.txt).
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] } # #[tokio::test] for the database tests.
-wiremock = "0.6" # Mock Bulk Data server; the client is never tested against a live one.
+[profile.release]
+lto = "thin"

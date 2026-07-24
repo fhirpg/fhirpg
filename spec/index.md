@@ -1,725 +1,304 @@
-# Specifications — index
-
-This directory holds the **living specifications** for `fhirpg`. It is
-the source of truth for spec-driven development: behaviour is defined here
-first, then implemented and verified. When code and spec disagree, reconcile
-them — do not let them drift.
-
-Operational guidance for agents (commands, conventions, how-to) lives in
-[`../AGENTS.md`](../AGENTS.md) and `../AGENTS/`. The delivery plan lives in
-[`../plan.md`](../plan.md) and [`../tasks.md`](../tasks.md). This directory
-defines **what must be true**, not how to work or in what order.
-
-## How to read these specs
-
-- Requirement levels use **MUST / SHOULD / MAY** in the RFC 2119 sense.
-- Each section ends with **acceptance criteria** — objective checks that decide
-  whether the requirement is met. The green gate (`cargo build`, `cargo test`,
-  `cargo clippy --all-targets -- -D warnings`) enforces most mechanically.
-- **fhirbase** means the Go program at `~/github/fhirbase/fhirbase`, which this
-  project translates. Citations of the form `load.go:680–733` point into it and
-  are normative references for behaviour being preserved.
-- `Xn` identifiers are the catalogued fhirbase defects in
-  [`../plan.md`](../plan.md#divergences-from-fhirbase). Where a section says a
-  defect is fixed, that fix is a requirement, not an option.
-
-## The specification set
-
-Sections §1–§10 below are normative today. As each grows past the 40 KB house
-limit it graduates into its own numbered file and this index keeps the summary
-and the link.
-
-| § | Scope | Status |
-| --- | --- | --- |
-| 1 | Identity, scope, non-goals | inline |
-| 2 | Storage model — tables, history, procedures, server requirements, identifiers | inline |
-| 3 | FHIR versions and assets | inline |
-| 4 | **The transformation algorithm** | inline (graduates first) |
-| 5 | Input formats and detection | inline |
-| 6 | Connection configuration | inline |
-| 7 | CLI contract | inline |
-| 8 | Loading semantics | inline |
-| 9 | Web console | inline |
-| 10 | R5 asset generation | inline |
-
-## Cross-cutting invariants
-
-Non-negotiable, across every section.
-
-1. **Green gate.** The crate MUST build, pass all unit tests and doctests, and
-   produce zero `cargo clippy --all-targets` warnings with `clippy::pedantic`
-   enabled.
-2. **No panic on input.** No code path reachable from file content, network
-   responses, database output, or command-line arguments may `panic!`,
-   `unwrap()`, `expect()`, or index out of bounds. Malformed input yields a
-   typed error naming the source. This is a hard requirement: fhirbase panics on
-   a malformed transform asset (X4) and on an invalid `--sslmode` (`db.go:59`).
-3. **No secrets in output.** The database password MUST NOT appear in logs,
-   `--help`, `Debug`/`Display` output, error messages, or process arguments
-   echoed back (X6).
-4. **Transform fidelity.** For the nine vendored FHIR versions, the transform
-   output MUST be `serde_json::Value`-equal to fhirbase's for the same input.
-   Fidelity is defined on *values*, not bytes: object key order is not
-   significant.
-5. **Identifier safety.** Every SQL identifier derived from data MUST be
-   validated against a known set and quoted before interpolation (X2).
-6. **Streaming.** Memory use MUST be bounded by the largest single resource, not
-   by input size. A 1 GB input MUST NOT produce a 1 GB allocation.
-7. **Spec authority.** For R5, the official HL7 FHIR specification JSON — as
-   surfaced by the sibling `fhir` crate's `fhir::r5::meta` — is upstream. These
-   specs interpret it for this project.
-
----
-
-## §1 Identity and scope
-
-`fhirpg` is a command-line utility that imports FHIR data into a
-PostgreSQL database and stores it relationally: one table per resource type,
-resource bodies as `jsonb`, with history tables and stored procedures for CRUD.
-
-**In scope:** the five commands of §7 — `init`, `transform`, `load`, `bulkget`,
-`web`.
-
-**Out of scope:** a FHIR REST server; FHIR search or FHIRPath evaluation;
-database backends other than PostgreSQL, and PostgreSQL releases older than 18
-(§2.3); re-implementing the FHIR data model (that is the sibling `fhir` crate);
-binary self-update and usage telemetry (both present in fhirbase, both
-deliberately dropped — decision D1); and migrating a database that fhirbase
-already initialized, whose `fhirbase_*` procedures this tool does not create or
-recognize (decision D3).
-
----
-
-## §2 Storage model
-
-The storage model is inherited from fhirbase unchanged. It is the reason the
-tool exists and MUST NOT be redesigned during translation.
-
-### 2.1 Tables
-
-For each resource type in the selected FHIR version, the schema MUST define two
-tables, named by the **lowercased** resource type:
-
-```sql
-CREATE TABLE IF NOT EXISTS "<resourcetype>" (
-  id text primary key,
-  txid bigint not null,
-  ts timestamptz DEFAULT current_timestamp,
-  resource_type text default '<ResourceType>',
-  status resource_status not null,
-  resource jsonb not null
-);
-
-CREATE TABLE IF NOT EXISTS "<resourcetype>_history" (
-  id text,
-  txid bigint not null,
-  ts timestamptz DEFAULT current_timestamp,
-  resource_type text default '<ResourceType>',
-  status resource_status not null,
-  resource jsonb not null,
-  PRIMARY KEY (id, txid)
-);
-```
-
-Table names MUST be double-quoted everywhere, in DDL and in DML. At least one
-FHIR resource type — **`Group`** — lowercases to a PostgreSQL reserved word, so
-unquoted use is a syntax error. fhirbase quotes in DDL but not in the insert
-loader, which is why it cannot load a `Group` at all (X2).
-
-`resource_type` and `id` are stored as columns *and* remain inside the `resource`
-`jsonb`; `_fhirpg_to_resource` reassembles the canonical resource from
-both.
-
-### 2.2 Supporting objects
-
-- `resource_status` — `ENUM ('created', 'updated', 'deleted', 'recreated')`,
-  created inside a `DO $$ … $$` guard so `init` is idempotent on the type.
-- `transaction (id serial primary key, ts timestamptz, resource jsonb)`. The
-  `serial` implicitly creates `transaction_id_seq`, which the single-argument
-  `fhirpg_create` and `fhirpg_update` procedures call via
-  `nextval`. Removing the `serial` would silently break them.
-- `concept` and `concept_history`, appended by the program rather than by the
-  version asset (`dbinit.go:16–33`).
-### 2.3 Server requirements
-
-**PostgreSQL 18 or newer is required** (decision D8). `init` MUST check the
-server version before executing any statement and refuse an older server with an
-actionable message.
-
-A consequence: `gen_random_uuid()` is a core function from PostgreSQL 13
-onward, so the `pgcrypto` extension is no longer needed. The nine vendored
-legacy assets nonetheless open with `CREATE EXTENSION IF NOT EXISTS pgcrypto`
-and MUST NOT be edited, because they are vendored byte-identical (§3). That
-statement fails on a PostgreSQL 18 installation without `contrib`. Therefore:
-
-- `init` MUST treat a failure of the `pgcrypto` `CREATE EXTENSION` statement —
-  **and only that statement** — as a warning rather than an error.
-- The generated R5 schema (§10) MUST NOT emit it at all.
-
-No other statement in any asset depends on the extension (decision D9).
-
-### 2.4 Stored procedures
-
-`assets/schema/functions.sql.json` holds 10 statements: the `_resource`
-composite type and these procedures, renamed from `fhirbase_*` per decision D3.
-
-| Procedure | Purpose |
-| --- | --- |
-| `fhirpg_genid()` | `uuidv7()::text` — see §2.5 |
-| `_fhirpg_to_resource(_resource)` | Merge columns back into canonical resource JSON, populating `meta.lastUpdated` and `meta.versionId` |
-| `fhirpg_create(jsonb, bigint)` / `(jsonb)` | Insert, archiving any existing row to `_history`; on conflict, status `recreated` |
-| `fhirpg_update(jsonb, bigint)` / `(jsonb)` | Update with history archival |
-| `fhirpg_read(text, text)` | Read by resource type and id |
-| `fhirpg_delete(text, text, bigint)` / `(text, text)` | Delete with history archival |
-
-The `_resource` composite type keeps its unbranded name.
-
-The three procedures that archive a prior version — `fhirpg_create`,
-`fhirpg_update`, `fhirpg_delete` — MUST obtain that prior version from
-`RETURNING OLD` on the same statement that writes the new one, not from a
-separate `SELECT … WHERE id = $2` in a sibling CTE as fhirbase does (decision
-D13). Beyond removing an index lookup, this guarantees the row written to
-`_history` is the genuine pre-image of the row that was replaced: a sibling CTE
-reads the statement snapshot while `ON CONFLICT DO UPDATE` re-reads the live
-row, so under `READ COMMITTED` with a concurrent writer the two can diverge.
-
-That divergence is **demonstrated**, not assumed. Against the translated
-procedures, `procedures_suite::d13_concurrency` reproduced it deterministically
-on PostgreSQL 18.4: a committed version was lost from history entirely. The
-same test now asserts the opposite and is the standing regression.
-
-Every SQL identifier a procedure builds MUST go through `format`'s `%I`, never
-`%s` (defect X15). Because `%I` quotes and therefore preserves case, while an
-unquoted identifier folds to lower case, the table name MUST be lowered
-explicitly before quoting; the `resourceType` **value** keeps its original case.
-
-`fhirpg_delete` MUST record status `'deleted'` on the history row it writes
-(defect X13), and MUST write **exactly one** history row. fhirbase writes two —
-the pre-image at its own `txid` and a second at the supplied one — which
-collides on `_history`'s `(id, txid)` primary key whenever the two are equal
-(defect X14), and that is the common case, since every bulk-loaded row has
-`txid = 0`. One row loses nothing: it carries the content that was live at
-deletion, and every earlier version was already archived by the create or
-update that superseded it.
-
-### 2.5 Identifier generation
-
-Every generated resource id MUST be a **UUIDv7** (decision D12). Ids are
-generated at three sites and they MUST agree:
-
-| Site | Mechanism |
-| --- | --- |
-| `fhirpg_genid()`, used by `fhirpg_create` when a resource has no `id` | `uuidv7()` |
-| The insert loader, for a resource with no `id` | `uuidv7()::text` server-side |
-| The copy loader, which must know the id before writing the row | `Uuid::now_v7()` client-side |
-
-fhirbase uses `gen_random_uuid()` at the first two sites and a client-side v4 at
-the third. UUIDv7 is time-ordered, so ids are near-sequential and insertion into
-the `id text` primary key index is mostly-append rather than random — the point
-of the change, on the bulk-load path the tool exists for. A mix of v4 and v7
-would forfeit that, which is why all three sites move together.
-
-Consequences that MUST be documented: generated ids embed their creation
-timestamp, and they are no longer interchangeable with fhirbase's.
-
-**Acceptance:** `init` succeeds for every supported version against an empty
-PostgreSQL 18 database, including one without `contrib` installed; a server
-older than 18 is refused with an actionable message; `transaction_id_seq`
-exists; `SELECT fhirpg_create('{"resourceType":"Patient"}'::jsonb)` returns a
-resource carrying `id`, `meta.versionId`, and `meta.lastUpdated`; no asset
-contains the string `fhirbase`.
-
----
-
-## §3 FHIR versions and assets
-
-Supported versions: **1.0.2, 1.1.0, 1.4.0, 1.6.0, 1.8.0, 3.0.1, 3.2.0, 3.3.0,
-4.0.0** (vendored byte-identical from fhirbase) and **5.0.0** (generated per
-§10). The default for `--fhir` is **5.0.0**, a deliberate divergence from
-fhirbase's 3.3.0 (decision D4).
-
-Each version has two assets:
-
-- `assets/schema/fhirpg-<version>.sql.json` — a JSON array of DDL
-  statement strings, executed in order. 4.0.0 has 293 statements covering 145
-  resource tables; the generated 5.0.0 has 318 covering 158.
-- `assets/transform/fhirpg-import-<version>.json` — the transformation
-  map of §4. 4.0.0 has 155 top-level entries, 929 `union` directives, and 737
-  `reference` directives.
-
-Requirements:
-
-- The nine vendored assets MUST remain byte-identical to fhirbase's, verified by
-  checksum. Only filenames change.
-- Transform maps MUST be parsed and cached at most once per version per process
-  (fhirbase memoizes identically, `transform.go:132–158`).
-- Loading a transform map MUST validate it: every `tr/move` target MUST resolve
-  to an existing top-level entry, and every `tr/act` value MUST be recognized.
-  Both hold for all nine vendored assets. A violation is a startup error.
-- An unknown `--fhir` value MUST produce an error listing the known versions.
-
----
-
-## §4 The transformation algorithm
-
-The core of the port. It rewrites a FHIR resource into fhirbase's storage
-representation, and its output is what lands in the `resource` `jsonb` column.
-Source: `transform.go:16–195`.
-
-### 4.1 The transformation map
-
-A JSON object keyed by type name (`Patient`, `Reference`, `Identifier`, …).
-Each value is a tree mirroring the resource's shape. A node's keys are either
-**directives** (prefixed `tr/`) or **field names** whose values are child nodes.
-
-| Directive | Meaning |
-| --- | --- |
-| `tr/act` | The action at this node: `union` or `reference` |
-| `tr/arg` | Arguments for the action: `{key, type}` for `union` |
-| `tr/move` | Continue transformation using the node at this path in the map root |
-| `tr/isCollection` | Present in the assets and **never read** — see 4.7 |
-
-### 4.2 Entry point
-
-Given a resource and a version:
-
-1. Read `resourceType`. If absent or not a string, this MUST be an error.
-2. Look up the map entry for that type. **If absent, return the resource
-   unchanged** — unknown resource types pass through untouched, which the
-   fhirbase test suite asserts explicitly.
-3. Otherwise transform the resource against that node.
-
-### 4.3 The recursion
-
-```text
-transform(node, tr_node, map):
-    if tr_node has tr/act AND node is not an array:
-        apply the action (4.4, 4.5) and return
-
-    match node:
-        object → for each (k, v):
-                     if tr_node has child k:
-                         child     := tr_node[k]
-                         out_key   := child.tr/arg.key  if present, else k
-                         if child has tr/move:
-                             child := resolve(map, child.tr/move)
-                         result[out_key] = transform(v, child, map)
-                     else:
-                         result[k] = transform(v, none, map)
-                 → result
-        array  → [ transform(e, tr_node, map) for e in node ]   # same tr_node
-        other  → node unchanged
-```
-
-The `tr/act` guard MUST test that the node is not an array. An array whose
-transform node carries `tr/act` falls through to the array branch, and each
-*element* receives the action — this is how repeating choice and reference
-fields work.
-
-`resolve(map, path)` walks the path from the map root. fhirbase's version
-performs an unchecked type assertion and panics on a missing segment (X4); this
-implementation MUST return an error instead. Because §3 validates every
-`tr/move` at load time, that error is unreachable for valid assets.
-
-### 4.4 `union` — collapsing polymorphic elements
-
-FHIR represents a choice element `value[x]` as a type-suffixed key —
-`valueString`, `valueQuantity`, `deceasedBoolean`. fhirbase collapses these into
-a single key holding a one-entry object tagged by type.
-
-Given `tr/arg = {key, type}` at a node reached from field `k`:
-
-1. The output key is `key`, not `k`. (`deceasedBoolean` → `deceased`.)
-2. Compute the inner value:
-   - If `type` is **`Reference`**, apply the reference action (4.5) to the node.
-   - Else if the map has a top-level entry named `type`, transform the node
-     against it.
-   - Else use the node unchanged.
-3. The result is `{ type: inner }`.
-
-```json
-{"deceasedBoolean": true}          →  {"deceased": {"boolean": true}}
-{"multipleBirthInteger": 2}        →  {"multipleBirth": {"integer": 2}}
-{"valueReference": {"reference": "Immunization/123"}}
-                                   →  {"value": {"Reference": {"resourceType": "Immunization", "id": "123"}}}
-```
-
-### 4.5 `reference` — splitting relative references
-
-A FHIR `Reference` is rewritten into an id/type pair:
-
-1. Start with an empty object.
-2. If `reference` is present, split its string value on `/`:
-   - exactly two components → `{resourceType: <first>, id: <second>}`;
-   - otherwise → `{id: <whole string>}`.
-3. If `display` is present, copy it.
-4. Emit that object.
-
-**All other fields of the `Reference` are discarded** — `identifier`, `type`,
-`extension`, `reference`'s original form. This is lossy, it is intentional, it
-is asserted by fhirbase's tests, and it MUST be preserved. It is documented here
-because it is the single most surprising behaviour in the algorithm.
-
-```json
-{"reference": "Practitioner/1", "display": "John"}
-                                   →  {"resourceType": "Practitioner", "id": "1", "display": "John"}
-{"reference": "urn:uuid:abc"}      →  {"id": "urn:uuid:abc"}
-{"display": "ACME corp"}           →  {"display": "ACME corp"}
-```
-
-Note the third case: a `Reference` with no `reference` field yields an object
-with only `display`.
-
-### 4.6 Determinism
-
-Two `union` directives can target the same output key — `deceasedBoolean` and
-`deceasedDateTime` both write `deceased`. FHIR forbids both being present, but
-input is untrusted. fhirbase's result depends on Go's randomized map iteration
-order and is therefore nondeterministic.
-
-This implementation MUST be deterministic: process object keys in a defined
-order and let the **last** key in that order win, so identical input always
-yields identical output. The rule MUST be documented and tested.
-
-### 4.7 `tr/isCollection`
-
-Present throughout the assets; never read by fhirbase, because 4.3's array
-branch already recurses with the same transform node, which handles repeating
-fields correctly for both actions. This implementation MUST also ignore it.
-Retained in the assets for byte-identical vendoring (§3) and emitted by the R5
-generator (§10) for consistency.
-
-### 4.8 Acceptance criteria
-
-- The five `transform_test.go` cases pass, ported verbatim: `CarePlan`
-  references and nested `Identifier.assigner`; `Claim.information[].valueReference`
-  (union-of-Reference); `Patient` with `deceasedBoolean`, `multipleBirthInteger`,
-  and `managingOrganization`; a `Reference` carrying only `display`; and an
-  unknown `resourceType` passing through unchanged.
-- Output is `serde_json::Value`-equal to fhirbase's across a corpus of ≥20
-  resources spanning ≥5 resource types, at 3.0.1 and 4.0.0.
-- Property tests: unknown `resourceType` is the identity; no input panics;
-  output is always valid JSON.
-- The both-variants-present case is deterministic across 1,000 runs.
-
----
-
-## §5 Input formats and detection
-
-`load` accepts three formats, each optionally gzip-compressed, mixed freely in
-one invocation. Detection is by **content, not filename** (`load.go:36–194`).
-
-### 5.1 Compression
-
-Attempt to read the file as gzip. On failure, rewind to offset 0 and read it as
-plaintext. No filename heuristic.
-
-### 5.2 Format
-
-1. Read the first two lines.
-2. If **both** are complete JSON objects — brace-balanced, counting only braces
-   outside string literals and honouring backslash escapes — the file is
-   **NDJSON**.
-3. Otherwise parse from the start and inspect `resourceType`:
-   - `"Bundle"` → **FHIR Bundle**; resources are read from `entry[].resource`.
-   - any other non-empty string → **single resource**.
-   - absent → treated as a FHIR Bundle.
-4. If the file has only one line, apply step 3 to it.
-
-### 5.3 Reading
-
-- **NDJSON:** one resource per line. A line whose root is not a JSON object MUST
-  be reported with filename and line number, and the rest of the file skipped —
-  fhirbase's behaviour, preserved.
-- **FHIR Bundle:** stream `entry[]`, yielding each `entry.resource`. A
-  non-object entry, or an entry without `resource`, is reported and the rest of
-  the file skipped. The array MUST be streamed, never buffered whole
-  (invariant 6).
-- **Single resource:** the whole document is one resource.
-- **Multiple inputs:** files are read in argument order; directory arguments are
-  walked recursively. A file that cannot be opened or whose format cannot be
-  determined MUST be reported and skipped, not fatal.
-
-### 5.4 Counts
-
-Resource counts drive progress display only. They MUST NOT influence batching,
-flushing, or termination (X7). Exact counts require a counting pass, which for
-compressed input means inflating twice; therefore progress is indeterminate by
-default and `--count-first` opts into exact totals.
-
-**Acceptance:** the five `load_test.go` detection cases pass verbatim, plus
-gzip, empty file, single-line file, BOM, and CRLF cases; peak RSS stays flat
-while reading a 1 GB bundle and a 1 GB NDJSON file.
-
----
-
-## §6 Connection configuration
-
-Precedence, highest first: explicit command-line flag → environment variable →
-built-in default.
-
-| Flag | Env | Default |
-| --- | --- | --- |
-| `-n, --host` | `PGHOST` | `localhost` |
-| `-p, --port` | `PGPORT` | `5432` |
-| `-U, --username` | `PGUSER` | `postgres` |
-| `-d, --db` | `PGDATABASE` | *(empty)* |
-| `-W, --password` | `PGPASSWORD` | *(empty)* |
-| `-s, --sslmode` | `PGSSLMODE` | `prefer` |
-
-`--sslmode` MUST accept exactly libpq's six values and behave accordingly:
-
-| Value | Behaviour |
-| --- | --- |
-| `disable` | Plaintext only |
-| `allow` | Plaintext first, TLS fallback |
-| `prefer` | TLS first without certificate verification, plaintext fallback |
-| `require` | TLS required, certificate not verified |
-| `verify-ca` | TLS required, certificate chain verified, **hostname not checked** |
-| `verify-full` | TLS required, chain and hostname verified |
-
-`verify-ca` MUST NOT verify the hostname. That is what distinguishes it from
-`verify-full`, and fhirbase collapses the two into one branch that verifies both
-(defect X12), refusing connections libpq would accept.
-
-`allow` MUST try plaintext first and fall back to TLS; `prefer` MUST try TLS
-first and fall back to plaintext. The two differ only in order, and
-`tokio-postgres` implements `prefer` natively but has no `allow`, so `allow` is
-implemented as two sequential connection attempts.
-
-An unrecognized value MUST be a typed error. fhirbase calls `panic!`
-(`db.go:59`); invariant 2 forbids that.
-
-Before executing any statement, a command that connects MUST verify the server
-is PostgreSQL 18 or newer (§2.3) and refuse an older one with an actionable
-message.
-
-The connection banner MUST report the **actual** `sslmode` and MUST redact the
-password. fhirbase hardcodes `sslmode=disable` into the banner regardless of the
-real setting and prints the password in cleartext, in two places (X6).
-
-**Acceptance:** a table-driven test covers all six modes and flag-vs-env
-precedence; a test asserts the password never appears in `Debug`, `Display`, or
-log output.
-
----
-
-## §7 CLI contract
-
-Binary: `fhirpg`. Global flags per §6, plus `-f, --fhir`. Subcommands:
-
-| Command | Arguments | Purpose |
-| --- | --- | --- |
-| `init` | — | Create the schema, procedures, and concept tables |
-| `transform` | `FILE` | Transform one resource, print to stdout |
-| `load` | `URL` \| `PATH…` | Load resources into the database |
-| `bulkget` | `URL DIR` | Download Bulk Data NDJSON to a directory |
-| `web` | — | Serve the SQL console |
-
-Command-specific flags: `load` takes `-m/--mode` (`insert` \| `copy`), `--numdl`
-(default 5), `--accept-header` (default `application/fhir+json`), `--strict`
-(§8.2), `--count-first` (§5.4), `--txid=new` (§8.2), `--memusage`, and `--validate`;
-`bulkget` takes `--numdl` and `--accept-header`; `web` takes `--webport`
-(default 3000) and `--webhost` (default `127.0.0.1` — see §9).
-
-`--validate` checks each resource against the typed FHIR model and reports what
-does not conform. It MUST report rather than reject: the loader exists to store
-data a strict model would refuse, so a non-conforming resource is counted and
-written, and only `--strict` turns a finding into an aborted run. It requires a
-build with the `validate` feature, and MUST fail with an actionable message when
-the selected FHIR version has no model in that build rather than silently
-checking nothing.
-
-`--memusage` reports the process's **resident set size**, current and peak,
-sampled every 3,000 resources. fhirbase's flag of the same name prints Go
-garbage-collector statistics (`Alloc`, `TotalAlloc`, `Sys`, `NumGC`), which have
-no Rust equivalent. Because RSS is a different quantity — resident pages
-including allocator slack, not live heap — the output MUST state what it is
-measuring, so it is not read as fhirbase's `Alloc` (decision D14).
-
-Requirements:
-
-- Flag names, short forms, and defaults MUST match fhirbase except where a
-  decision says otherwise (`--fhir` default per D4, `--webhost` default per §9,
-  `--nostats` removed per D1).
-- Invoking with no subcommand prints help and exits **0**.
-- A command error prints the error and exits **1**.
-- Missing required arguments print that command's help and exit non-zero.
-- `--help` retains the ASCII-art banner (rebranded) and the long per-command
-  descriptions, which are genuinely useful documentation.
-
----
-
-## §8 Loading semantics
-
-### 8.1 Modes
-
-- **`insert`** — batched, pipelined `INSERT … ON CONFLICT (id) DO NOTHING`.
-  Order-insensitive; tolerates duplicate ids by keeping the first occurrence;
-  performs identically on grouped and non-grouped input. The default for local
-  files.
-- **`copy`** — `COPY … FROM STDIN`. A single `COPY` covers a maximal run of
-  consecutive same-typed resources; a new one begins when the type changes.
-  Roughly 3× faster on **grouped** input (all resources of a type adjacent, as
-  produced by Bulk Data servers) and slower on non-grouped input. The default
-  when the argument is a Bulk Data URL.
-
-Both modes MUST produce identical rows for identical input.
-
-### 8.2 Per-resource pipeline
-
-1. Read the next resource (§5).
-2. Determine `resourceType`. It MUST be validated against the selected version's
-   known resource set; an unknown type is reported and the resource skipped.
-   Only then is the lowercased name quoted and used as a table name (X2).
-3. Transform it (§4). A transform failure MUST be explicit and MUST NOT write a
-   row. By default the resource is **skipped and counted**, and the tally is
-   reported at the end of the run (§8.4); under `--strict` the run aborts with a
-   non-zero exit instead (decision D10). fhirbase prints the error and then
-   inserts the possibly-null result anyway (X3).
-4. Determine the id: the resource's `id` if a non-empty string, else a generated
-   **UUIDv7** (§2.5).
-5. Write with `txid = 0` and `status = 'created'`, matching fhirbase.
-   `--txid=new` allocates one real `transaction_id_seq` value for the run
-   instead (X10).
-
-### 8.3 Batching
-
-Flush when the batch buffer is full, and once at end of stream. Flushing MUST
-NOT depend on a resource count (X7). Batch size defaults to 2,000, fhirbase's
-value.
-
-### 8.4 Reporting
-
-On completion, print total resources, elapsed seconds, and a right-aligned
-table of counts per resource type. Skipped resources — unopenable files,
-undetectable formats, unknown types, transform failures — MUST be surfaced in
-that summary rather than only as scrollback.
-
-**Acceptance:** a `Group` resource loads successfully in both modes (fhirbase
-cannot); `resourceType` values containing SQL metacharacters are rejected rather
-than executed; loading `demo/bundle.ndjson.gzip` yields per-type counts matching
-`SELECT count(*)`; duplicate ids keep the first occurrence.
-
----
-
-## §9 Web console
-
-`web` serves the vendored static console plus two endpoints:
-
-- `GET /q?query=<sql>` — executes the SQL and streams
-  `{"columns": […], "rows": [[…]]}`. A missing `query` is 400; a SQL error is a
-  non-200 with `{"message": …}`; neither may panic.
-- `GET /health` — 200 when a connection can be acquired and a trivial query
-  runs.
-
-The server shuts down gracefully on SIGINT.
-
-The console's assets MUST contain no third-party tracking and MUST fetch nothing
-from a third party at runtime. fhirbase's console carries Google Analytics and
-Yandex Metrica — the latter with session recording — on a page that renders
-patient data, and reports every SQL statement the user runs as an analytics
-event (defect X17). Decision D1 removed telemetry from the binary; the UI MUST
-NOT reinstate it.
-
-Values MUST be rendered by the server, via `row_to_json`, not decoded per type
-in the client. The console runs arbitrary SQL, so a column may be of any type,
-including one an extension added; a client-side type table silently returns
-null for whatever it has not heard of.
-
-**Security.** `/q` executes arbitrary SQL with no authentication. That is the
-feature. fhirbase compounds it by defaulting `--webhost` to the empty string,
-binding all interfaces. This implementation MUST default to `127.0.0.1`, MUST
-require an explicit `--webhost` to expose the port, and MUST print a prominent
-warning when a non-loopback address is bound. The risk MUST be documented in
-README and in `web --help` (X11).
-
----
-
-## §10 R5 asset generation
-
-fhirbase's newest assets are 4.0.0; R5 has none, and the generator that produced
-the originals was never published. The two 5.0.0 assets are therefore generated
-from the sibling `fhir` crate's `fhir::r5::meta` element table — 9,333 entries
-derived from the official HL7 specification JSON — then hand-verified and
-vendored (decision D5).
-
-### 10.1 Schema asset
-
-Emit, in order: the `resource_status` enum inside its `DO $$ … $$` guard; the
-`transaction` table; then for each R5 resource type the pair of tables from
-§2.1. Column shapes, defaults, and quoting MUST match the 4.0.0 asset exactly.
-
-The generated asset MUST NOT emit `CREATE EXTENSION … pgcrypto`. PostgreSQL 18
-is required (§2.3) and provides `gen_random_uuid()` in core, so the extension is
-dead weight that fails on installations without `contrib` (decision D9). This is
-the one intentional structural difference from the vendored legacy schemas.
-
-### 10.2 Transform asset
-
-For each element path in the metadata:
-
-- Path ending in `[x]` → one `union` entry per declared type code, keyed
-  `<base><TypeCode>` with `tr/arg = {key: <base>, type: <TypeCode>}`. The
-  suffix uses FHIR's capitalization rule, so `deceased[x]` with type `boolean`
-  yields key `deceasedBoolean` and `type` `boolean`.
-- Type code `Reference` → `tr/act: "reference"`.
-- `max` other than `"1"` → `tr/isCollection: true` (§4.7: emitted, never read).
-- A complex datatype reference → `tr/move: ["<TypeName>"]`, with that type
-  present as a top-level entry.
-
-### 10.3 Verification
-
-An oracle exists after all, contrary to what decision D5 assumed. The sibling
-`fhir` crate ships the official StructureDefinitions for R3, R4, **and** R5, and
-fhirbase generated its own maps from the same source — so the generator can be
-run against R3 and R4 and diffed against fhirbase's vendored 3.0.1 and 4.0.0
-assets.
-
-It MUST reproduce them. Measured (see `doc/r5-generation/validation.md`):
-
-| Release | Compared against | Shared nodes | Identical |
-| --- | --- | ---: | ---: |
-| R3 | fhirbase 3.0.1 | 126 | 126 (100%) |
-| R4 | fhirbase 4.0.0 | 155 | 151 (97%) |
-
-The four R4 differences are a specification change, not a defect: FHIR's open
-type list gained `Meta` between 4.0.0 and 4.0.1, and 4.0.1 is the R4 the crate
-ships.
-
-The generator MUST read the specification JSON directly rather than the `fhir`
-crate's API, so that `fhir` is a dependency of nothing and cannot block
-publication (risk R5).
-
-Beyond the oracle, correctness rests on four further checks, all of which are
-requirements:
-
-1. **Structural.** Both files parse; every `tr/move` target resolves; every
-   table name is unique, lowercase, and quoted; the resource-type count is 158.
-2. **Plausibility.** `union` and `reference` totals fall within a defensible
-   band of 4.0.0's 929 and 737.
-3. **Differential.** For resource types present in both R4 and R5, diff the
-   generated R5 transform against the vendored 4.0.0 one. **Every** difference
-   MUST be explainable by a documented R4→R5 specification change; the analysis
-   is recorded in this directory.
-4. **Manual.** At least ten diverse resource types — `Patient`, `Observation`,
-   `Bundle`, `Group`, `MedicationRequest`, `Encounter`, `Questionnaire`,
-   `Subscription`, `Evidence`, `ImplementationGuide` — are checked element by
-   element against the published R5 specification, with the record kept here.
-
-**Acceptance:** all four checks pass and are recorded; `init --fhir 5.0.0`
-succeeds; the `fhirpg_*` procedures round-trip an R5 `Patient`.
-
----
-
-## Status
-
-**Specification proposed, implementation not started.** The target repository
-currently contains only a hello-world `main.rs`. §1–§10 define the behaviour to
-be built; [`../tasks.md`](../tasks.md) sequences the work; each task names the
-sections it satisfies.
-
-Divergences from fhirbase are deliberate and enumerated in
-[`../plan.md`](../plan.md): seventeen defect fixes (X1–X17) and fourteen decisions
-(D1–D14). Nothing else in the observable behaviour may differ without a spec
-change landing first.
+# fhirpg specification
+
+This is the normative specification for fhirpg. Requirements are numbered and
+use RFC 2119 keywords. Sections: [Scope](#1-scope), [Schema
+generation](#2-schema-generation), [Storage model](#3-storage-model),
+[Shredding and reconstruction](#4-shredding-and-reconstruction),
+[Versioning and history](#5-versioning-and-history), [Search](#6-search),
+[REST API](#7-rest-api), [CLI](#8-cli), [Validation](#9-validation),
+[Operations](#10-operations), [Conformance testing](#11-conformance-testing).
+
+## 1. Scope
+
+- **S1.1** fhirpg MUST support FHIR R5 (5.0.0), R4 (4.0.1), and R3 (3.0.2).
+  R5 is the default everywhere a version is optional.
+- **S1.2** Each FHIR version's data lives in its own PostgreSQL schema:
+  `r5`, `r4`, `r3`. Versions are independent; a database MAY host any subset.
+- **S1.3** All resource types defined by the version's specification MUST be
+  supported — no unsupported-type errors for spec-defined types.
+- **S1.4** Target database is PostgreSQL 18. Features requiring ≥18 MAY be
+  used; older servers are unsupported.
+
+## 2. Schema generation
+
+- **G2.1** DDL and relational maps MUST be generated from the official FHIR
+  specification packages (StructureDefinitions, SearchParameters) by
+  `fhirpg gen`, and the generated artifacts MUST be committed under
+  `assets/` so that builds and installs never require the spec packages.
+- **G2.2** Generation MUST be deterministic: same spec input → byte-identical
+  output. `assets/CHECKSUMS.txt` records SHA-256 of every artifact.
+- **G2.3** Identifier naming: element paths convert to snake_case
+  (`birthDate` → `birth_date`). Table names concatenate the resource name and
+  element path (`Patient.name.given` → `patient_name_given`).
+- **G2.4** PostgreSQL truncates identifiers at 63 bytes. Where a generated
+  name would exceed 63 bytes, the generator MUST abbreviate deterministically
+  and, on residual collision, suffix with a 6-hex-digit hash of the full
+  path. The full-path → identifier mapping MUST be recorded in the relational
+  map and in a generated `doc/` index; two different paths MUST never map to
+  the same identifier.
+- **G2.5** `fhirpg init` MUST be idempotent and effectively atomic. Because
+  creating thousands of tables in one transaction exceeds default PostgreSQL
+  lock budgets (`max_locks_per_transaction`), init stages the install under
+  a temporary schema (`r5__init`) in chunked transactions and then renames
+  it into place in a single statement; a failed init leaves only the staging
+  schema, which the next init removes. Init records the applied artifact
+  checksum in `fhirpg_meta`, no-ops when the installed checksum matches, and
+  refuses to run against a schema created from a different artifact (see §10
+  migrations). Schema drops are likewise chunked.
+
+## 3. Storage model
+
+### Base tables
+
+- **M3.1** Every resource type gets a base table named for the resource
+  (`r5.patient`). Its primary key is `id text`.
+- **M3.2** Base-table system columns: `id text PRIMARY KEY`,
+  `version_id bigint NOT NULL` (monotonic per resource, starts at 1),
+  `last_updated timestamptz NOT NULL`. `Resource.meta` is otherwise stored
+  like any other element.
+- **M3.3** Every scalar (non-repeating, primitive-typed) element of the
+  resource becomes a typed column on the base table.
+
+### Child tables
+
+- **M3.4** Every **repeating** element becomes a child table. A child table
+  carries:
+  - `rid text NOT NULL` — the root resource id, FK to the base table with
+    `ON DELETE CASCADE`,
+  - `ords smallint[] NOT NULL` — the 1-based index at each repeating
+    ancestor crossing from the resource root down to and including this
+    element (`{2,1}` = second parent instance, first child instance),
+  - primary key `(rid, ords)`,
+  - typed columns for every scalar element reachable without crossing
+    another repeating element.
+  The array form (rather than one ordinal column per level) is what lets
+  recursive elements (`Questionnaire.item.item`, via `contentReference`)
+  share one table at any depth: recursion appears as longer `ords` paths.
+- **M3.5** Non-repeating complex elements (datatypes and backbone elements)
+  **flatten** into the nearest enclosing table as prefixed columns
+  (`Patient.maritalStatus.text` → `patient.marital_status_text`); only their
+  repeating descendants open tables. Three exceptions force a table for a
+  non-repeating element, with a fixed ordinal of 1: (a) a flattened width
+  that would approach PostgreSQL's 1600-column limit (generator threshold
+  150 columns — this catches the open `value[x]` choices with ~54 types),
+  (b) backbone elements targeted cyclically by a `contentReference`
+  (`ImplementationGuide.definition.page`), and (c) nothing else. There are
+  no shared "coding" tables; each usage site owns its rows.
+
+### Type mapping
+
+- **M3.6** FHIR primitive → PostgreSQL column types:
+
+  | FHIR | PostgreSQL |
+  | --- | --- |
+  | boolean | `boolean` |
+  | integer, unsignedInt, positiveInt | `integer` |
+  | integer64 (R5) | `bigint` |
+  | decimal | `numeric` — original textual precision MUST survive round-trip |
+  | string, code, id, markdown, uri, url, canonical, oid, uuid, xhtml, base64Binary | `text` |
+  | date | `text` + derived `date` column `<name>_sort` |
+  | dateTime, instant | `text` (verbatim) + derived `timestamptz` column `<name>_sort` for ordering/search |
+  | time | `text` (fractional-second lexical fidelity) |
+
+  Partial dates ("2026", "2026-07") make FHIR temporal values
+  non-representable in native types without loss, hence verbatim text plus a
+  derived sort column, computed by the engine at write time (partial values
+  sort at their period start; offset-less dateTimes sort as UTC).
+- **M3.7** Elements bound `required` to a FHIR value set get a
+  `CHECK (col IN (…))` constraint generated from the code system; other
+  binding strengths are unconstrained columns.
+
+### Choice elements
+
+- **M3.8** A choice element `value[x]` becomes one column (or child table,
+  for complex types) per allowed type — `value_boolean`, `value_quantity_…` —
+  plus a generated `CHECK` that at most one alternative is populated.
+
+### References
+
+- **M3.9** A Reference element stores: `<name>_ref_type text`,
+  `<name>_ref_id text` (parsed from relative literal references),
+  `<name>_ref_url text` (absolute/other references, verbatim), plus columns
+  for `display` and expanded `identifier`. Parsing MUST be reversible: the
+  original `reference` string reconstructs exactly.
+- **M3.10** Referential integrity across resources is NOT enforced by
+  foreign keys (FHIR permits dangling references). `fhirpg` MAY offer an
+  advisory integrity report; it MUST NOT reject writes for dangling refs.
+
+### Extensions and primitive extensions
+
+- **M3.11** Extensions are stored relationally as **typed leaf rows** in one
+  generated table per resource type:
+  `<resource>_ext(rid, path, ords, modifier, ext_ord, url, leaf, v_kind,
+  v_text, v_num, v_bool)`, PK (rid, path, ords, modifier, ext_ord, leaf).
+  `path`/`ords` locate the attach point (dotted JSON-name path, "" for the
+  resource itself; ordinals at each repeating crossing). `ext_ord` is the
+  1-based index in the extension array (`modifier` distinguishes
+  modifierExtension); `url` is the top-level extension url, denormalized for
+  querying. `leaf` addresses one scalar inside the extension's content as a
+  dotted path whose all-digit segments are 0-based array indexes
+  (`valueCodeableConcept.coding.0.code`); nested extensions are ordinary
+  leaves (`extension.0.valueString`). `v_kind` ∈ s/n/b/z tags the JSON
+  scalar kind; numbers keep their lexical form in `v_text` and a queryable
+  `numeric` in `v_num`. This one uniform encoding covers every extension
+  value type — including arbitrarily nested complex values — with no
+  JSONB and no per-type tables.
+- **M3.12** Primitive extensions (`_birthDate` etc.) reuse M3.11 with the
+  primitive's path (and the entry index, for repeating primitives);
+  element ids ride the same table as `ext_ord = 0, leaf = 'id'` rows.
+  Reconstruction MUST re-emit the `_field` form exactly, including null
+  padding in parallel arrays.
+- **M3.13** `Resource.contained` resources are stored in a per-resource
+  table `<resource>_contained(rid, ord, resource jsonb)`. Elements typed
+  `Resource` (Bundle.entry.resource, Parameters.parameter.resource) become
+  jsonb columns the same way. These are the sanctioned JSONB usages besides
+  history (plan.md D7): such values are anonymous whole resources of
+  unknowable type, so normalizing them buys nothing.
+- **M3.14** The FHIR type graph contains one true datatype cycle:
+  `Reference.identifier: Identifier` and `Identifier.assigner: Reference`.
+  Static expansion cuts a cycle at the element that would re-enter an
+  in-expansion type (`….identifier.assigner`), and stores anything below the
+  cut as leaf rows (M3.11 encoding, minus extension columns) in a
+  per-resource `<resource>_deep(rid, path, ords, leaf, v_kind, v_text,
+  v_num, v_bool)` table — lossless, relational, and vanishingly rare in
+  real data.
+
+## 4. Shredding and reconstruction
+
+- **R4.1** Shredding (JSON → rows) and reconstruction (rows → JSON) are
+  driven by the generated relational map through one generic engine; no
+  per-resource handwritten code.
+- **R4.2** Round-trip MUST be lossless: for any valid resource,
+  `reconstruct(shred(r))` is semantically identical JSON — same values
+  (including decimal precision and partial dates), same array order, key
+  order not significant. This invariant is enforced by property tests over
+  spec examples and generated resources.
+- **R4.3** Unknown elements (not in the version's spec) MUST be rejected
+  with an error naming the path — never silently dropped.
+- **R4.4** A resource write (shred + delete-old-rows + insert) MUST be a
+  single transaction.
+
+## 5. Versioning and history
+
+- **H5.1** Every create/update/delete increments `version_id` and appends
+  one row to `<resource>_history(id, version_id, last_updated, op char(1),
+  resource jsonb)` where `op` ∈ C/U/D. History is an immutable audit
+  archive; JSONB is acceptable there because it is written once and read
+  only by vread/history/audit (decision D7, plan.md).
+- **H5.2** Delete is soft at the API level (history row with op = D; base
+  and child rows removed); a deleted id's history remains readable.
+- **H5.3** vread serves any historical version from history; read serves the
+  current version reconstructed from the relational tables. A checksum
+  comparison between the two paths is part of the test suite, not runtime.
+
+## 6. Search
+
+- **P6.1** All standard SearchParameters of each version MUST be compiled by
+  the generator into SQL predicate templates over the normalized columns.
+  Search types supported: token, string, date, number, quantity, reference,
+  uri; composite and special parameters MAY be deferred (documented per
+  parameter in generated docs).
+- **P6.2** String search default is case-insensitive prefix match
+  (`:exact` and `:contains` modifiers supported). Token search matches
+  `system|code` semantics. Date search implements FHIR range/prefix
+  semantics (eq, ne, lt, gt, ge, le, sa, eb) against the `_sort` columns
+  with precision-aware ranges.
+- **P6.3** Result parameters: `_count` (default 50, max 1000), paging via
+  opaque cursor, `_sort` on searchable params, `_id`, `_lastUpdated`,
+  `_total=accurate|estimate`, `_include`/`_revinclude` (single hop).
+- **P6.4** The generator MUST emit indexes for: every base-table search
+  column, every child-table FK + ord, reference `(ref_type, ref_id)` pairs,
+  and token `(system, code)` pairs.
+- **P6.5** Unsupported search parameters MUST return an OperationOutcome
+  warning and be ignored per FHIR's lenient handling, or error under
+  `Prefer: handling=strict`.
+
+## 7. REST API
+
+- **A7.1** The server mounts each installed version at `/{r3|r4|r5}` and
+  implements: `GET  {base}/metadata` (CapabilityStatement),
+  instance `GET/PUT/DELETE {base}/{type}/{id}`, `GET …/_history` and
+  `GET …/_history/{vid}`, type-level `POST {base}/{type}` (create) and
+  `GET {base}/{type}` (search, also via `POST …/_search`), and system
+  `POST {base}` for batch and transaction Bundles.
+- **A7.2** JSON is the required format (`application/fhir+json`); XML is
+  available behind the `xml` feature via the fhir crate.
+- **A7.3** Concurrency: responses carry `ETag: W/"{version_id}"`; PUT and
+  DELETE honor `If-Match` and MUST return 412 on mismatch. Conditional
+  create/update/delete via `If-None-Exist` and conditional references in
+  transactions MUST be supported.
+- **A7.4** Transactions are a single database transaction with FHIR
+  processing order (DELETE, POST, PUT, GET), urn:uuid reference resolution,
+  and all-or-nothing semantics. Batch entries are independent.
+- **A7.5** Every error is an OperationOutcome with correct HTTP status
+  (400 malformed, 404 unknown id/type, 405, 409/412 version conflict,
+  410 deleted, 422 rejected resource, 500 with an opaque incident id —
+  internal detail goes to logs, never to clients).
+- **A7.6** Request bodies are capped (default 32 MiB, configurable);
+  overlong URLs and pathological search inputs are rejected 414/400.
+
+## 8. CLI
+
+- **C8.1** Commands: `init`, `load`, `export`, `transform`, `serve`, `gen`.
+  Global flags: `--fhir-version {r3|r4|r5}` (default r5), PostgreSQL
+  connection via standard `PG*` environment variables or `--dsn`.
+- **C8.2** `load` accepts NDJSON, Bundle JSON, or single-resource JSON,
+  gzipped or plain, detected by content not filename; memory use is bounded
+  by the largest single resource. Bad resources are reported with file, line
+  and path; `--strict` stops on first error, default skips-and-reports;
+  the exit code is nonzero if any resource failed.
+- **C8.3** `transform` prints, for one input resource, every row it would
+  produce as (table, columns) — the debugging window into the storage model.
+- **C8.4** `export` streams NDJSON of reconstructed current resources,
+  optionally filtered by type; output round-trips through `load`.
+
+## 9. Validation
+
+- **V9.1** Structural validation (element existence, cardinality, primitive
+  lexical rules, choice exclusivity, required bindings) always runs — it is
+  inherent to shredding against the map.
+- **V9.2** `--validate` (CLI) / `X-Fhirpg-Validate: strict` (server config
+  default-on) additionally deserializes through the typed `fhir` crate model
+  for the resource's version and rejects on any mismatch.
+- **V9.3** Validation failure at the API returns 422 with an
+  OperationOutcome listing each issue with a FHIRPath-style location.
+
+## 10. Operations
+
+- **O10.1** `serve` exposes `/health` (liveness) and `/ready` (DB
+  connectivity) endpoints off the FHIR base paths, and Prometheus metrics on
+  a separate configurable port (request counts/latencies by route,
+  pool stats, per-resource-type row counts).
+- **O10.2** Structured logging via `tracing` (JSON in production); every
+  request gets a request id, echoed in `X-Request-Id`. Logs MUST NOT contain
+  resource content (PHI) at default level.
+- **O10.3** Connection pooling via deadpool; pool exhaustion returns 503
+  with `Retry-After`, never queues unboundedly. Statement timeouts are set
+  per pool connection.
+- **O10.4** Schema migrations: `fhirpg_meta` records artifact versions;
+  `fhirpg init --upgrade` applies generated migration DDL between artifact
+  versions transactionally where possible, and refuses destructive changes
+  without `--allow-destructive`. Every release documents its migration.
+- **O10.5** TLS: production deployments terminate TLS at a fronting proxy,
+  or in-process behind the `tls` feature (rustls). The server binds
+  localhost by default; binding non-loopback requires explicit
+  `--bind` acknowledgement. Authentication/authorization (SMART on FHIR,
+  OAuth) is explicitly out of scope for the server core and delegated to the
+  deployment perimeter; the spec requires documenting this boundary.
+- **O10.6** Backup/restore is plain PostgreSQL (`pg_dump`/PITR); the book
+  documents point-in-time recovery and the invariant that a consistent
+  snapshot is always a valid fhirpg store.
+
+## 11. Conformance testing
+
+- **T11.1** Round-trip property tests (R4.2) over every example resource
+  shipped with each FHIR specification, plus proptest-generated resources.
+- **T11.2** Live-database integration tests exercise every REST interaction
+  in §7 against PostgreSQL 18 in CI (docker compose).
+- **T11.3** Search semantics tests derive cases from the FHIR search
+  specification per parameter type, including precision-edge dates and
+  token system matching.
+- **T11.4** The CapabilityStatement MUST be generated from what is actually
+  implemented (the relational map + supported params), never hand-edited.
+- **T11.5** Load/serve benchmarks are tracked in `doc/benchmarks.md`; a
+  regression gate compares against the recorded baseline.

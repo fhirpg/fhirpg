@@ -1,0 +1,22 @@
+[package]
+name = "fhirpg-store"
+description = "PostgreSQL storage layer for fhirpg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fhirpg-map.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+deadpool-postgres.workspace = true
+tracing.workspace = true
+futures-util = "0.3"
+
+[dev-dependencies]
+fhirpg-gen = { path = "../fhirpg-gen" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

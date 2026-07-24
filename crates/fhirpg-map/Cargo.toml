@@ -1,0 +1,14 @@
+[package]
+name = "fhirpg-map"
+description = "Relational map model and generic shred/reconstruct engine for fhirpg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+flate2.workspace = true

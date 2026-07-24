@@ -1,8 +1,0 @@
-{
-    "managingOrganization": {
-        "display": "A",
-        "id": "1",
-        "resourceType": "Organization"
-    },
-    "resourceType": "Patient"
-}

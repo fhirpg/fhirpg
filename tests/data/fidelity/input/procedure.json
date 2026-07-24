@@ -1,1 +1,0 @@
-{"resourceType": "Procedure", "status": "completed", "subject": {"reference": "Patient/1"}, "performedPeriod": {"start": "2020-01-01"}, "performer": [{"actor": {"reference": "Practitioner/1"}}]}

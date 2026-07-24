@@ -1,1 +1,0 @@
-{"resourceType": "CarePlan", "careTeam": [{"reference": "Practitioner/1", "display": "John"}, {"reference": "Practitioner/2"}], "identifier": [{"system": "foo", "value": "bar"}, {"system": "foo", "value": "baz", "assigner": {"reference": "Practitioner/42", "display": "JD"}}]}

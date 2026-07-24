@@ -1,6 +1,0 @@
-{
-    "managingOrganization": {
-        "id": "http://ex.com/fhir/Organization/1"
-    },
-    "resourceType": "Patient"
-}

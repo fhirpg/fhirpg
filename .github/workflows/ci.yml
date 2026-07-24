@@ -10,140 +10,67 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --all-targets
-
   test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # Must pass with no database, no network, no container runtime.
-      - run: cargo test
-      - run: cargo test --doc
-      # Spec §4.8 asks for 10,000 property-test cases. The local edit-test loop
-      # runs proptest's default so it stays fast; CI pays the real cost.
-      - run: cargo test property_tests
-        env:
-          PROPTEST_CASES: 10000
-
-  features:
-    name: Feature builds
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # The `validate` feature pulls in the typed FHIR R5 model (task T24). It
-      # must build and pass on its own, and the default build must not need it.
-      - run: cargo build --all-targets --features validate
-      - run: cargo test --features validate
-      - run: cargo clippy --all-targets --features validate -- -D warnings
-
-  clippy:
-    name: Clippy
+    name: Build, lint, test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
-
-  doc:
-    name: Docs
-    runs-on: ubuntu-latest
-    env:
-      RUSTDOCFLAGS: -D warnings
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps
-
-  msrv:
-    name: MSRV (1.88)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --all-targets
-      - run: cargo test
+      # Unit tests pass with no database and no spec packages present;
+      # the corpus/spec-driven tests skip themselves when inputs are absent.
+      - run: cargo test --workspace
 
   database:
-    name: Database tests (PostgreSQL 18)
+    name: Live-database tests (PostgreSQL 18)
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      # GitHub Actions' `services:` block is Docker-backed, so it cannot be used
-      # here: this project standardizes on Podman (decision D11). Podman is
-      # preinstalled on the Ubuntu runners, so start the container explicitly.
-      - name: Start PostgreSQL 18 under Podman
-        run: |
-          podman run -d --name fhirpg-db -p 5433:5432 \
-            -e POSTGRES_USER=fhirpg \
-            -e POSTGRES_PASSWORD=fhirpg \
-            -e POSTGRES_DB=fhirpg \
-            docker.io/library/postgres:18
-
-      # Poll pg_isready rather than relying on a Compose healthcheck, which a
-      # bare `podman run` does not give us.
-      - name: Wait for PostgreSQL
-        run: |
-          for i in $(seq 1 30); do
-            if podman exec fhirpg-db pg_isready -U fhirpg -d fhirpg; then
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "PostgreSQL did not become ready in time" >&2
-          podman logs fhirpg-db >&2
-          exit 1
-
-      - name: Confirm the server is PostgreSQL 18 or newer
-        run: |
-          podman exec fhirpg-db psql -U fhirpg -d fhirpg -tAc 'SHOW server_version'
-
-      - name: Run the ignored database tests
+    services:
+      postgres:
+        image: postgres:18
         env:
-          FHIRPG_TEST_DB: host=localhost port=5433 user=fhirpg password=fhirpg dbname=fhirpg
-        run: cargo test -- --ignored
-
-      - name: Container logs on failure
-        if: failure()
-        run: podman logs fhirpg-db
-
-  book:
-    name: mdBook
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install mdBook
-        run: |
-          mkdir -p "$HOME/.local/bin"
-          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz \
-            | tar -xz -C "$HOME/.local/bin"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - run: mdbook build book
-
-  publish-dry-run:
-    name: Publish dry-run
-    runs-on: ubuntu-latest
+          POSTGRES_USER: fhirpg
+          POSTGRES_PASSWORD: fhirpg
+          POSTGRES_DB: fhirpg
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U fhirpg"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: fhirpg
+      PGPASSWORD: fhirpg
+      FHIRPG_TEST_DB: fhirpg
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo publish --dry-run
+      # The live tests need the FHIR definitions and an example corpus.
+      - name: Fetch FHIR spec packages and example corpora
+        run: |
+          mkdir -p spec-cache corpus
+          for pair in "r5 R5" "r4 R4" "r3 STU3"; do
+            set -- $pair
+            mkdir -p "spec-cache/$1/fhir-definitions-json"
+            curl -sSL "https://hl7.org/fhir/$2/definitions.json.zip" -o defs.zip
+            unzip -qo defs.zip -d "spec-cache/$1/fhir-definitions-json"
+            curl -sSL "https://hl7.org/fhir/$2/examples-json.zip" -o ex.zip
+            cdir=$(echo "$1" | sed 's/r3/stu3/')
+            mkdir -p "corpus/$cdir"
+            unzip -qo ex.zip -d "corpus/$cdir"
+          done
+      - name: Live tests (round trip, M2 semantics, search) + 10k proptests
+        env:
+          FHIRPG_SPEC_DIR: ${{ github.workspace }}/spec-cache
+          FHIRPG_CORPUS_DIR: ${{ github.workspace }}/corpus
+          FHIRPG_TEST_CORPUS_LIMIT: "400"
+          FHIRPG_PROPTEST_CASES: "10000"
+        run: |
+          cargo test --release -p fhirpg-gen --test proptest_roundtrip -- --nocapture
+          cargo test --release -p fhirpg-store -p fhirpg-server -- --nocapture

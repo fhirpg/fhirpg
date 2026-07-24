@@ -1,189 +1,136 @@
-# fhirpg — FHIR to PostgreSQL
+# fhirpg — FHIR in PostgreSQL, relationally
 
-Import [FHIR](https://www.hl7.org/fhir/) data into a PostgreSQL database and
-work with it relationally: one table per resource type, resource bodies as
-`jsonb`, plus history tables and stored procedures for create, read, update,
-and delete.
+Store [FHIR](https://hl7.org/fhir/) resources in PostgreSQL 18 as **real
+relational tables** — typed columns, child tables, foreign keys, and check
+constraints — not JSON or JSONB blobs. Serve them back through the standard
+FHIR RESTful API.
 
-`fhirpg` is a Rust translation of
-[fhirbase](https://github.com/fhirbase/fhirbase), a Go utility by Health
-Samurai that has been unmaintained since 2019.
+- **Given FHIR data** (NDJSON, Bundles, single resources, or REST writes),
+  fhirpg shreds each resource into normalized tables generated from the FHIR
+  specification itself.
+- **Given a FHIR request** (read, vread, search, history, batch/transaction),
+  fhirpg reconstructs resources from those tables, losslessly, and answers
+  over HTTP exactly as a FHIR server must.
 
-> **Status: pre-release.** All five commands work against PostgreSQL 18, at
-> every FHIR version from 1.0.2 to 5.0.0, with 172 tests plus 43 that run
-> against a live database. Not yet published to crates.io. The delivery plan is
-> in [`plan.md`](plan.md) and the normative behaviour in
-> [`spec/index.md`](spec/index.md).
+Supported FHIR versions: **R5 (5.0.0, default), R4 (4.0.1), R3 (3.0.2)** —
+each with its own generated schema, installed side by side in PostgreSQL
+schemas `r5`, `r4`, `r3`.
+
+> **Status: functional end to end, pre-release.** The generator, the
+> shred/reconstruct engine, the PostgreSQL store, search, and the FHIR REST
+> server all work: all **7,399 official FHIR example resources** (R3 + R4 +
+> R5) round-trip **losslessly** through the fully normalized schema — in
+> memory, through live PostgreSQL 18, and 10,000 generated property-test
+> cases besides. 94.8% of R5 search parameters compile to indexed SQL, and
+> `fhirpg serve` mounts every installed version with CRUD, history, ETag
+> concurrency, search, and all-or-nothing transaction Bundles. Remaining
+> before production: `_sort`/`_include`/cursor paging, conditional
+> operations, and the M6 hardening list in [`tasks.md`](tasks.md). This is
+> a ground-up rewrite of the earlier fhirbase-style fhirpg (jsonb bodies;
+> see git history). Normative behaviour: [`spec/index.md`](spec/index.md);
+> measurements: [`doc/benchmarks.md`](doc/benchmarks.md).
+
+## Why relational
+
+JSONB storage makes writing FHIR easy and querying it painful. Normalized
+storage inverts that trade, and for a production clinical system the trade is
+right:
+
+- **Integrity the database enforces** — enum columns backed by FHIR value
+  sets, `CHECK` constraints on choice elements, typed dates and decimals,
+  reference columns that can be joined and (optionally) constrained.
+- **SQL that reads like the domain** — `SELECT family FROM r5.patient_name`,
+  no `->>'…'` path spelunking, and the query planner sees real column
+  statistics.
+- **Search that is just SQL** — FHIR search parameters compile to indexed
+  predicates on ordinary columns.
 
 ## Quick start
 
 ```sh
-cargo install fhirpg
+cargo install --path crates/fhirpg
 export PGHOST=localhost PGUSER=you PGDATABASE=clinic
 
-fhirpg init                       # create the schema
-fhirpg load export/*.ndjson       # load resources
-fhirpg web                        # browse with SQL
+fhirpg init --fhir-version r5     # create the generated relational schema
+fhirpg load export/*.ndjson       # shred and load resources
+fhirpg serve                      # FHIR REST server on 127.0.0.1:8080
+fhirpg get Patient example        # reconstruct one resource
+fhirpg export Patient             # stream resources back out as NDJSON
+fhirpg transform patient.json     # show the rows a resource shreds into
 ```
 
-Then query it as ordinary relational data:
+Then query relationally:
 
 ```sql
-SELECT resource->>'gender' AS gender, count(*)
-  FROM patient
- GROUP BY 1 ORDER BY 2 DESC;
+SELECT n.family, count(o.id) AS observations
+  FROM r5.patient p
+  JOIN r5.patient_name n ON n.rid = p.id AND n.ords = '{1}'
+  LEFT JOIN r5.observation o
+    ON o.subject_ref_type = 'Patient' AND o.subject_ref_id = p.id
+ GROUP BY n.family
+ ORDER BY observations DESC;
 ```
 
-References are split into an id and a type when stored, so joins need no string
-parsing:
+Every child table addresses its rows with `rid` (the resource id) and
+`ords smallint[]` (the 1-based index path through repeating elements), so
+arbitrarily nested — even recursive — structure stays joinable.
 
-```sql
-SELECT p.resource->'name'->0->>'family' AS family,
-       count(o.id) AS observations
-  FROM patient p
-  LEFT JOIN observation o ON o.resource->'subject'->>'id' = p.id
- GROUP BY 1 ORDER BY 2 DESC;
-```
-
-Choice elements are collapsed, with the type moved inside — `deceasedBoolean`
-becomes `deceased.boolean`. See [the storage model](book/src/storage-model.md),
-or just look:
+Or over FHIR REST:
 
 ```sh
-fhirpg transform patient.json
+curl 'localhost:8080/r5/metadata'                  # CapabilityStatement
+curl 'localhost:8080/r5/Patient?name=smith&_count=10'
+curl 'localhost:8080/r5/Observation?subject=Patient/123&date=ge2026-01-01'
+curl -X POST localhost:8080/r5 -d @transaction-bundle.json \
+     -H 'content-type: application/fhir+json'      # all-or-nothing
 ```
 
 ## Commands
 
-| | |
+| Command | Purpose |
 | --- | --- |
-| `fhirpg init` | create the schema for a FHIR version |
-| `fhirpg load <paths…\|url>` | load NDJSON, Bundles, or single resources; gzipped or not |
-| `fhirpg transform <file>` | show what one resource becomes when stored |
-| `fhirpg bulkget <url> <dir>` | run a Bulk Data export and save the NDJSON |
-| `fhirpg web` | a browser SQL console, bound to localhost |
+| `fhirpg init` | create the generated schema for a FHIR version |
+| `fhirpg load <paths…>` | load NDJSON, Bundles, or single resources (gzip ok) |
+| `fhirpg get / delete` | read back or remove one resource (history retained) |
+| `fhirpg export` | reconstruct resources back out as NDJSON |
+| `fhirpg transform <file>` | show the rows one resource shreds into |
+| `fhirpg search <Type> [name=value…]` | run a FHIR search from the shell |
+| `fhirpg serve` | run the FHIR RESTful API server (every installed version) |
+| `fhirpg drop --yes` | remove one version's schema and data |
+| `fhirpg gen` | (dev) regenerate the relational-map assets from FHIR specs |
 
-Formats and compression are detected by **content, not filename**. Memory is
-bounded by the largest single resource: a 1 GB Bundle reads with about 2 MB of
-growth.
+## Architecture in one paragraph
+
+A build-time generator (`fhirpg gen`) reads each FHIR version's
+StructureDefinitions and SearchParameters and emits two artifacts per
+version: the **DDL** (every resource's base table plus child tables for
+repeating and nested elements) and a compact **relational map**. At runtime a
+single generic engine walks any resource against the map to shred it into
+rows, and walks the map in reverse to reconstruct the identical resource —
+round-trip fidelity is a tested invariant, including decimal precision.
+Search parameters compile against the same map into SQL. The HTTP layer is
+axum; storage access is tokio-postgres with a deadpool pool; every write is
+one transaction with optimistic concurrency via FHIR ETags. The
+[`fhir`](https://crates.io/crates/fhir) crate supplies the typed R3/R4/R5
+model for optional strict validation (`--validate`).
+
+## Production posture
+
+fhirpg targets mission-critical clinical deployment: transactional writes,
+version history and audit on every resource, optimistic locking, structured
+logging with `tracing`, Prometheus metrics, health/readiness endpoints,
+connection pooling, versioned migrations, and a documented backup and
+zero-downtime upgrade story. See [`spec/index.md`](spec/index.md) §
+Operations. fhirpg handles PHI: deployments must put TLS and authentication
+in front of it (or terminate TLS in-process via the `tls` feature) — the
+spec defines what fhirpg guarantees and what the deployment must provide.
 
 ## Documentation
 
-- **[The book](book/src/SUMMARY.md)** — getting started, the storage model,
-  loading, querying, Bulk Data, the web console, FHIR versions.
 - [`spec/index.md`](spec/index.md) — the normative specification.
-- [`doc/benchmarks.md`](doc/benchmarks.md) — measurements against fhirbase.
-- [`plan.md`](plan.md) — decisions D1–D15 and the catalogued fhirbase defects
-  X1–X17.
-
-## Performance
-
-Measured against fhirbase itself on its own demo bundle — 127,454 resources —
-against PostgreSQL 18.4. Full method and caveats in
-[`doc/benchmarks.md`](doc/benchmarks.md).
-
-| Input | Mode | fhirbase | fhirpg |
-| --- | --- | ---: | ---: |
-| non-grouped | `insert` | 4.95 s | **3.39 s** |
-| non-grouped | `copy` | 43.58 s | **43.23 s** |
-| grouped | `copy` | — | **1.20 s** |
-
-Copy mode is 2.5× faster than insert on grouped input and 13× slower on
-non-grouped, which is why the default depends on the source: `insert` for local
-files, `copy` for Bulk Data, which arrives grouped.
-
-Worth knowing before you compare yourself: **fhirbase cannot connect to
-PostgreSQL 18 at all** with default authentication — its 2018-vintage driver
-predates SCRAM-SHA-256. The benchmark only runs against a server reconfigured
-for trust authentication.
-
-## Optional: validation
-
-A build with the `validate` feature can check each resource against the typed
-FHIR R5 model from the [`fhir`](https://crates.io/crates/fhir) crate:
-
-```sh
-cargo install fhirpg --features validate
-fhirpg --db clinic load --validate export/*.ndjson
-```
-
-```
-Patient: gender.code: code "platypus" is not in the required value set
-Observation: does not match the FHIR R5 model: missing field `status`
-
-3 resource(s) did not conform to the FHIR model, and were loaded anyway.
-```
-
-It **reports; it does not reject.** Storing data a strict model would refuse is
-the point of the tool, so non-conforming resources are counted and written —
-`--strict` turns the first finding into an aborted run if you want that. The
-feature is off by default because it compiles a large generated model that a
-normal load never touches.
-
-## Requirements
-
-- **PostgreSQL 18 or newer.** The stored procedures use `uuidv7()` for
-  identifier generation and `RETURNING OLD` for history archival, both of which
-  arrived in 18.
-- **Rust 1.88 or newer** to build from source.
-- [Podman](https://podman.io/) if you want the bundled test database:
-  `podman compose up -d`.
-
-## How it differs from fhirbase
-
-This is a translation, not a fork: the storage model, the transformation
-algorithm, and the command surface are fhirbase's. What changed, and why, is
-recorded as decisions D1–D14 in [`plan.md`](plan.md). The ones you would notice:
-
-- **FHIR R5 by default** (fhirbase defaults to 3.3.0, and stops at 4.0.0).
-  Versions 1.0.2 through 4.0.0 remain selectable with `--fhir`.
-- **PostgreSQL 18 required**, where fhirbase targets 10.
-- **No usage telemetry and no binary self-update.** fhirbase phones home on
-  every run unless you pass `--nostats`; `fhirpg` has nothing to disable.
-- **Stored procedures are named `fhirpg_*`**, not `fhirbase_*`. This means
-  `fhirpg` cannot operate on a database that fhirbase initialized, and vice
-  versa.
-- **Generated ids are UUIDv7**, not v4, so they sort by creation time and index
-  better on bulk loads. They do embed a creation timestamp.
-
-It also fixes seventeen defects catalogued in the Go original (X1–X17 in
-[`plan.md`](plan.md)), including an SQL injection vector in the insert loader,
-a cleartext password in the connection banner, and an inability to load FHIR
-`Group` resources at all.
-
-## Security note
-
-The `web` command serves a browser console that runs **arbitrary SQL with no
-authentication**. That is what it is for. It binds `127.0.0.1` by default;
-setting `--webhost` to anything else exposes an unauthenticated database
-console on the network. Do not do that on an untrusted network, and never
-against a database holding real patient data.
-
-## Development
-
-```sh
-cargo build --all-targets
-cargo test                                    # hermetic: no database needed
-cargo clippy --all-targets -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-```
-
-All four must pass before any change is considered done. For the database
-tests:
-
-```sh
-podman compose up -d
-FHIRPG_TEST_DB="host=localhost port=5433 user=fhirpg password=fhirpg dbname=fhirpg" \
-  cargo test -- --ignored
-```
-
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`AGENTS.md`](AGENTS.md).
+- [`plan.md`](plan.md) — design decisions, risks, milestones.
+- [`tasks.md`](tasks.md) — the implementation work breakdown.
 
 ## License
 
-`MIT OR Apache-2.0 OR GPL-2.0-only`. Material derived from fhirbase remains
-under its MIT terms, © 2018 Health Samurai; see [`LICENSE.md`](LICENSE.md).
-
-FHIR® is a registered trademark of Health Level Seven International.
-PostgreSQL® is a registered trademark of the PostgreSQL Community Association
-of Canada. This project is affiliated with neither.
+MIT OR Apache-2.0.

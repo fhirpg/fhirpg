@@ -1,0 +1,33 @@
+[package]
+name = "fhirpg"
+description = "FHIR in PostgreSQL, relationally: normalized storage plus a FHIR REST server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "fhirpg"
+path = "src/main.rs"
+
+[dependencies]
+fhirpg-map.workspace = true
+fhirpg-gen.workspace = true
+fhirpg-store.workspace = true
+fhirpg-server.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+flate2.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# The published crate's r3/r4 features do not compile (missing macro
+# import); validation is R5-only until fhir > 1.2.0 fixes that.
+fhir = { version = "1.2", optional = true }
+axum = "0.8"
+
+[features]
+validate = ["dep:fhir"]

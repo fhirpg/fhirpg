@@ -17,8 +17,15 @@ tokio.workspace = true
 tokio-postgres.workspace = true
 deadpool-postgres.workspace = true
 tracing.workspace = true
+sha2.workspace = true
 futures-util = "0.3"
+tokio-postgres-rustls = "0.14"
+rustls = "0.23"
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
 
 [dev-dependencies]
 fhirpg-gen = { path = "../fhirpg-gen" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true

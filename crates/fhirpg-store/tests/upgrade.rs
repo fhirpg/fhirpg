@@ -107,3 +107,88 @@ async fn upgrade_applies_diff() {
     let report = down_store.upgrade("down-sum", true).await.expect("forced");
     assert!(report.destructive > 0);
 }
+
+/// Upgrading an install written before folded search columns existed (P6.6)
+/// must backfill them.
+///
+/// Without the backfill the columns are added NULL, and every string search
+/// compares the folded column — so existing patients simply stop being found.
+/// That failure is invisible: no error, no warning, just fewer results.
+#[tokio::test]
+async fn upgrade_backfills_folded_columns() {
+    let Ok(db) = std::env::var("FHIRPG_TEST_DB") else {
+        eprintln!("skipping: FHIRPG_TEST_DB not set");
+        return;
+    };
+    let Some(defs) = spec_defs() else {
+        eprintln!("skipping: no spec dir");
+        return;
+    };
+    // SAFETY: single-threaded at this point.
+    unsafe { std::env::set_var("PGDATABASE", &db) };
+
+    let full = fhirpg_gen::generate(&defs, "foldtest").expect("generate");
+    // The "old" deployment: the map as it was before folding existed.
+    let mut pre_fold = full.clone();
+    for rm in pre_fold.resources.values_mut() {
+        for t in &mut rm.tables {
+            let dropped: Vec<String> = t.norm_cols.iter().map(|(_, d)| d.clone()).collect();
+            t.cols.retain(|c| !dropped.contains(&c.name));
+            t.norm_cols.clear();
+        }
+        for def in &mut rm.search {
+            for tgt in &mut def.targets {
+                if let fhirpg_map::model::TargetKind::Str { norm, .. } = &mut tgt.kind {
+                    *norm = None;
+                }
+            }
+        }
+    }
+
+    let cfg = fhirpg_store::pg_config(None).expect("cfg");
+    let old = Store::connect(cfg, Arc::new(pre_fold))
+        .await
+        .expect("connect");
+    old.drop_schema().await.expect("drop");
+    old.init("pre-fold").await.expect("init old");
+    old.put(&json!({"resourceType": "Patient", "id": "muller",
+                    "name": [{"family": "Müller"}]}))
+        .await
+        .expect("seed");
+    // On the old schema this still worked, via ILIKE — case-insensitive only.
+    let hits = old
+        .search(
+            "Patient",
+            &[("family".to_string(), "müller".to_string())],
+            10,
+            0,
+        )
+        .await
+        .expect("old search");
+    assert_eq!(hits, ["muller"], "pre-fold search should still work");
+
+    let cfg = fhirpg_store::pg_config(None).expect("cfg");
+    let new = Store::connect(cfg, Arc::new(full)).await.expect("connect");
+    let report = new.upgrade("post-fold", false).await.expect("upgrade");
+    assert!(report.additive > 0, "expected the new columns");
+    assert!(report.folded > 0, "expected values to be folded");
+
+    // The seeded patient, written before the column existed, is now findable
+    // by an unaccented spelling.
+    for term in ["muller", "Müller", "MUL"] {
+        let hits = new
+            .search(
+                "Patient",
+                &[("family".to_string(), term.to_string())],
+                10,
+                0,
+            )
+            .await
+            .expect("search");
+        assert_eq!(hits, ["muller"], "family={term:?} after backfill");
+    }
+
+    // Backfill is idempotent: nothing left to fold on a second pass.
+    let again = new.upgrade("post-fold", false).await.expect("re-upgrade");
+    assert_eq!(again.folded, 0, "backfill should have nothing left to do");
+}

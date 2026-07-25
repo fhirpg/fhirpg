@@ -25,5 +25,6 @@ pub fn generate(definitions_dir: &Path, schema: &str) -> Result<RelMap, GenError
     let spec = spec::load_spec(definitions_dir)?;
     let mut map = build::build_map(&spec, schema)?;
     search::compile_search(&mut map, definitions_dir)?;
+    search::add_norm_columns(&mut map);
     Ok(map)
 }

@@ -77,9 +77,14 @@ pub struct SearchTarget {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TargetKind {
-    /// Case-insensitive prefix/contains match on a text column.
+    /// Case- and accent-insensitive prefix/contains match on a text column.
     Str {
         col: String,
+        /// Companion folded column (P6.6). `:exact` compares `col`; every
+        /// other modifier compares `norm`. `None` only for maps generated
+        /// before folding existed.
+        #[serde(default)]
+        norm: Option<String>,
     },
     /// system|code semantics. `system` is None for bare code/boolean
     /// primitives.
@@ -140,6 +145,11 @@ pub struct Table {
     pub path: String,
     /// Data columns. Empty for the fixed-shape system tables.
     pub cols: Vec<Column>,
+    /// `(source, folded)` column-name pairs (P6.6). The shredder fills each
+    /// `folded` column from the `source` value it just wrote, so the write
+    /// path and the query path share one definition of string equality.
+    #[serde(default)]
+    pub norm_cols: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +168,11 @@ pub enum ColTy {
     BigInt,
     Numeric,
     Text,
+    /// Derived search-fold column (P6.6). `COLLATE "C"` so that ordering is by
+    /// Unicode codepoint, which is what lets a prefix search run as a plain
+    /// btree range scan rather than a pattern match the planner has to
+    /// recognise. Never reconstructed into a resource.
+    TextC,
     /// Derived sort column for a FHIR date.
     Date,
     /// Derived sort column for a FHIR dateTime/instant.

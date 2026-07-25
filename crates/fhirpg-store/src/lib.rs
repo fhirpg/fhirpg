@@ -23,7 +23,14 @@ use tokio_postgres::types::ToSql;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
-    #[error("postgres: {0}")]
+    /// A database failure.
+    ///
+    /// Displayed through [`pg_detail`] rather than as `{0}`:
+    /// `tokio_postgres::Error`'s own `Display` is the bare string
+    /// `"db error"`, and everything an operator needs — the SQLSTATE, the
+    /// message, the hint — hangs off `source()`. Logging the outer error
+    /// alone throws away the entire diagnosis.
+    #[error("postgres: {}", pg_detail(.0))]
     Pg(#[from] tokio_postgres::Error),
     #[error("pool: {0}")]
     Pool(String),
@@ -33,8 +40,48 @@ pub enum StoreError {
     /// not match the stored one (HTTP 412 at the API layer).
     #[error("version conflict: expected {expected}, found {found}")]
     Conflict { expected: i64, found: i64 },
+    /// A client-safe rejection: the request asked for something this server
+    /// does not do, described in terms of the request itself (a parameter
+    /// name, a modifier, a sort key). Safe to return verbatim — it names
+    /// what the caller sent, never what is stored (spec A7.11).
+    #[error("{0}")]
+    Unsupported(String),
+    /// An internal failure. The text is diagnostics for the operator and may
+    /// mention schema or values, so it belongs in the log behind an incident
+    /// id, never in a response body.
     #[error("{0}")]
     Other(String),
+}
+
+/// The useful half of a `tokio_postgres::Error`: SQLSTATE, message, and hint
+/// from the `DbError` behind `source()`.
+///
+/// This text is for logs, never for a response body (spec A7.11) — it can
+/// name schema objects and, in a constraint violation, values.
+fn pg_detail(e: &tokio_postgres::Error) -> String {
+    match e.as_db_error() {
+        Some(db) => {
+            let mut out = format!("[{}] {}", db.code().code(), db.message());
+            if let Some(d) = db.detail() {
+                out.push_str(&format!(" — {d}"));
+            }
+            if let Some(h) = db.hint() {
+                out.push_str(&format!(" (hint: {h})"));
+            }
+            out
+        }
+        // Transport, TLS, and protocol failures have no DbError; walk the
+        // chain so the cause is not lost either.
+        None => {
+            let mut out = e.to_string();
+            let mut src = std::error::Error::source(e);
+            while let Some(s) = src {
+                out.push_str(&format!(": {s}"));
+                src = s.source();
+            }
+            out
+        }
+    }
 }
 
 impl From<deadpool_postgres::PoolError> for StoreError {
@@ -50,10 +97,217 @@ pub struct PutOutcome {
     pub created: bool,
 }
 
+/// Who is responsible for a change, and how we know (spec M3.15, PR12.1–4).
+///
+/// fhirpg does not authenticate — that is the perimeter's job (plan D13) —
+/// but "authentication is elsewhere" cannot mean "the record of who did what
+/// is nowhere" (D15). The perimeter knows the identity; only the store knows
+/// which rows were touched, so only the store can join the two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Audit {
+    /// The authenticated principal, or `unauthenticated`.
+    pub actor: String,
+    /// How the principal was established, e.g. `header:X-Fhirpg-Principal`
+    /// or `cli`. Recorded so a reader can weigh how much the actor is worth.
+    pub actor_source: Option<String>,
+    /// Source address as the server observed it.
+    pub client: Option<String>,
+    /// The value echoed in `X-Request-Id`, tying this row to the logs.
+    pub request_id: Option<String>,
+    /// Caller-supplied purpose of use.
+    pub reason: Option<String>,
+}
+
+impl Default for Audit {
+    fn default() -> Self {
+        Self::unattributed()
+    }
+}
+
+impl Audit {
+    /// A write with no identity behind it. Recorded as such rather than left
+    /// blank: "we do not know who did this" is itself an audit finding.
+    #[must_use]
+    pub fn unattributed() -> Self {
+        Audit {
+            actor: "unauthenticated".to_string(),
+            actor_source: None,
+            client: None,
+            request_id: None,
+            reason: None,
+        }
+    }
+
+    /// A write by the operator running the CLI on this host.
+    #[must_use]
+    pub fn cli() -> Self {
+        let who = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "unknown".to_string());
+        Audit {
+            actor: format!("cli:{who}"),
+            actor_source: Some("cli".to_string()),
+            client: None,
+            request_id: None,
+            reason: None,
+        }
+    }
+
+    /// A write attributed to a principal the perimeter vouched for.
+    #[must_use]
+    pub fn principal(actor: impl Into<String>, source: impl Into<String>) -> Self {
+        Audit {
+            actor: actor.into(),
+            actor_source: Some(source.into()),
+            client: None,
+            request_id: None,
+            reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_client(mut self, client: Option<String>) -> Self {
+        self.client = client;
+        self
+    }
+
+    #[must_use]
+    pub fn with_request_id(mut self, request_id: Option<String>) -> Self {
+        self.request_id = request_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_reason(mut self, reason: Option<String>) -> Self {
+        self.reason = reason;
+        self
+    }
+}
+
+/// One disclosure record (spec PR12.5).
+#[derive(Debug, Clone)]
+pub struct AccessRecord {
+    pub audit: Audit,
+    /// `read`, `vread`, `history`, `search`, `export`.
+    pub interaction: String,
+    pub rtype: Option<String>,
+    pub id: Option<String>,
+    pub version_id: Option<i64>,
+    /// `ok`, `not-found`, `denied`, `error`.
+    pub outcome: String,
+    pub result_count: Option<i64>,
+}
+
+/// What an erasure removed (spec M3.18).
+#[derive(Debug, PartialEq, Eq)]
+pub struct PurgeReport {
+    /// History rows removed, not counting the tombstone left behind.
+    pub versions_erased: u64,
+    /// Whether the resource was known at all.
+    pub existed: bool,
+}
+
+/// A break in one resource's hash chain (spec M3.16).
+#[derive(Debug, Clone)]
+pub struct ChainBreak {
+    pub rtype: String,
+    pub id: String,
+    pub version_id: i64,
+    pub detail: String,
+}
+
 #[derive(Debug)]
 pub struct UpgradeReport {
     pub additive: usize,
     pub destructive: usize,
+    /// Distinct string values folded into new search columns (P6.6).
+    pub folded: usize,
+}
+
+/// Open the read snapshot every multi-statement read runs in (spec R4.5).
+///
+/// `REPEATABLE READ` gives all statements in the transaction one snapshot;
+/// `READ ONLY` lets PostgreSQL skip taking an xid and makes the intent
+/// unmistakable to anyone reading a `pg_stat_activity` dump.
+async fn snapshot(
+    client: &mut deadpool_postgres::Client,
+) -> Result<deadpool_postgres::Transaction<'_>, StoreError> {
+    client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .await
+        .map_err(StoreError::Pg)
+}
+
+/// Append one history row with its audit envelope and hash link, in one
+/// statement (spec M3.15, M3.16).
+///
+/// The chain is computed in SQL rather than in Rust for two reasons: the
+/// hashed `last_updated` is then the value actually stored (`now()`, the
+/// database's clock, not the client's), and the read of the previous row's
+/// hash cannot race the insert, because both are the same statement.
+///
+/// `LEFT JOIN LATERAL … ON true` is what makes the first version work: a
+/// plain subquery would yield no rows and insert nothing.
+#[allow(clippy::too_many_arguments)]
+async fn append_history(
+    tx: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+    hist: &str,
+    id: &str,
+    version: i64,
+    op: &str,
+    resource_json: Option<&String>,
+    audit: &Audit,
+) -> Result<(), StoreError> {
+    // Every parameter is cast explicitly: each is used twice — once as the
+    // column value and once inside the hash — and PostgreSQL will not deduce
+    // one type for two such uses.
+    //
+    // The hash covers `resource::jsonb::text`, the *stored* normalized form,
+    // not the submitted text. jsonb reorders keys and rewrites number
+    // spellings, so hashing the input would make every chain fail
+    // verification the moment it was checked against what was actually saved.
+    let sql = format!(
+        "INSERT INTO \"{schema}\".\"{hist}\" \
+           (\"id\", \"version_id\", \"last_updated\", \"op\", \"resource\", \
+            \"actor\", \"actor_source\", \"client\", \"request_id\", \"reason\", \
+            \"prev_hash\", \"row_hash\") \
+         SELECT $1::text, $2::bigint, ts.v, $3::text, ($4::text)::jsonb, \
+                $5::text, $6::text, $7::text, $8::text, $9::text, \
+                prev.\"row_hash\", \
+                sha256( \
+                  coalesce(prev.\"row_hash\", '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea) \
+                  || convert_to( \
+                       $1::text || '|' || ($2::bigint)::text || '|' || ts.v::text \
+                       || '|' || $3::text || '|' \
+                       || coalesce((($4::text)::jsonb)::text, '') || '|' || $5::text, \
+                       'UTF8') \
+                ) \
+         FROM (SELECT now() AS v) ts \
+         LEFT JOIN LATERAL ( \
+             SELECT h.\"row_hash\" FROM \"{schema}\".\"{hist}\" h \
+             WHERE h.\"id\" = $1::text ORDER BY h.\"version_id\" DESC LIMIT 1 \
+         ) prev ON true"
+    );
+    tx.execute(
+        &sql,
+        &[
+            &id,
+            &version,
+            &op,
+            &resource_json,
+            &audit.actor,
+            &audit.actor_source,
+            &audit.client,
+            &audit.request_id,
+            &audit.reason,
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -77,6 +331,48 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, StoreError> {
 pub struct SearchOutcome {
     pub ids: Vec<String>,
     pub total: Option<i64>,
+}
+
+/// The result of a conditional create (`If-None-Exist`).
+#[derive(Debug)]
+pub enum CondCreate {
+    /// No match: the resource was created.
+    Created(PutOutcome),
+    /// Exactly one match: it is returned unchanged, per FHIR.
+    Existing(String),
+    /// More than one match: the criteria are not selective enough (412).
+    Multiple,
+}
+
+/// The result of a conditional delete.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CondDelete {
+    Deleted,
+    NoMatch,
+    Multiple,
+}
+
+/// The advisory-lock key for one set of conditional criteria.
+///
+/// Criteria are order-insensitive as far as FHIR is concerned, so they are
+/// sorted before hashing: `identifier=x&name=y` and `name=y&identifier=x`
+/// select the same resources and must contend for the same lock.
+fn criteria_lock_key(schema: &str, rtype: &str, criteria: &[(String, String)]) -> i64 {
+    use sha2::{Digest, Sha256};
+    let mut sorted: Vec<&(String, String)> = criteria.iter().collect();
+    sorted.sort();
+    let mut h = Sha256::new();
+    h.update(schema.as_bytes());
+    h.update([0]);
+    h.update(rtype.as_bytes());
+    for (k, v) in sorted {
+        h.update([0]);
+        h.update(k.as_bytes());
+        h.update([1]);
+        h.update(v.as_bytes());
+    }
+    let d = h.finalize();
+    i64::from_be_bytes(d[..8].try_into().expect("32-byte digest"))
 }
 
 #[derive(Debug)]
@@ -139,6 +435,121 @@ pub struct Store {
     map: Arc<RelMap>,
 }
 
+/// How the connection to PostgreSQL is protected (spec O10.7).
+///
+/// The link between fhirpg and its database carries whole resources — it is
+/// exactly as sensitive as the link to the client, and until now it was
+/// unconditionally plaintext.
+///
+/// fhirpg deliberately deviates from libpq in one direction only: libpq's
+/// `require` encrypts without validating the server certificate, which stops
+/// a passive eavesdropper but not an active one. Here `require` validates.
+/// `verify-ca` and `verify-full` are accepted as synonyms for it, because
+/// rustls always checks the hostname — there is no "CA but not hostname"
+/// mode to offer, and the stricter reading is the safe one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SslPolicy {
+    /// No TLS. Only appropriate for a loopback connection on a host where
+    /// nothing else runs.
+    Disable,
+    /// Use TLS if the server offers it (the default, matching libpq).
+    #[default]
+    Prefer,
+    /// Require TLS, and validate the server certificate and hostname.
+    Require,
+}
+
+impl SslPolicy {
+    /// Parse a libpq `sslmode` value.
+    ///
+    /// # Errors
+    /// Returns an error for a value libpq defines but fhirpg does not
+    /// implement, rather than silently choosing a weaker mode.
+    pub fn parse(s: &str) -> Result<Self, StoreError> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "disable" => Ok(Self::Disable),
+            "prefer" | "allow" => Ok(Self::Prefer),
+            "require" | "verify-ca" | "verify-full" => Ok(Self::Require),
+            other => Err(StoreError::Other(format!(
+                "unknown sslmode {other:?}; expected disable, prefer, require, \
+                 verify-ca, or verify-full"
+            ))),
+        }
+    }
+
+    /// The policy from `PGSSLMODE`, or the default.
+    ///
+    /// # Errors
+    /// Propagates a malformed `PGSSLMODE`.
+    pub fn from_env() -> Result<Self, StoreError> {
+        match std::env::var("PGSSLMODE") {
+            Ok(v) => Self::parse(&v),
+            Err(_) => Ok(Self::default()),
+        }
+    }
+
+    /// Whether this policy leaves PHI on the wire in the clear.
+    #[must_use]
+    pub fn is_encrypted(self) -> bool {
+        self == Self::Require
+    }
+}
+
+/// Connection pool size, configurable rather than compiled in (spec O10.8).
+///
+/// An explicit value wins over `FHIRPG_POOL_SIZE`, which wins over the
+/// default: a flag the operator typed should not be silently overridden by an
+/// environment variable they inherited.
+fn pool_size(explicit: Option<usize>) -> usize {
+    explicit
+        .filter(|n| *n > 0)
+        .or_else(|| {
+            std::env::var("FHIRPG_POOL_SIZE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|n| *n > 0)
+        })
+        .unwrap_or(16)
+}
+
+/// Trust anchors for the database connection: `PGSSLROOTCERT` when set,
+/// otherwise the platform store.
+fn root_store() -> Result<rustls::RootCertStore, StoreError> {
+    let mut roots = rustls::RootCertStore::empty();
+    if let Ok(path) = std::env::var("PGSSLROOTCERT") {
+        let pem = std::fs::read(&path)
+            .map_err(|e| StoreError::Other(format!("PGSSLROOTCERT {path}: {e}")))?;
+        let mut reader = std::io::BufReader::new(pem.as_slice());
+        let mut added = 0usize;
+        for cert in rustls_pemfile::certs(&mut reader) {
+            let cert = cert.map_err(|e| StoreError::Other(format!("PGSSLROOTCERT {path}: {e}")))?;
+            roots
+                .add(cert)
+                .map_err(|e| StoreError::Other(format!("PGSSLROOTCERT {path}: {e}")))?;
+            added += 1;
+        }
+        if added == 0 {
+            return Err(StoreError::Other(format!(
+                "PGSSLROOTCERT {path} contains no certificates"
+            )));
+        }
+        return Ok(roots);
+    }
+    let native = rustls_native_certs::load_native_certs();
+    if native.certs.is_empty() {
+        let first = native.errors.first().map_or_else(
+            || "no certificates found".to_string(),
+            std::string::ToString::to_string,
+        );
+        return Err(StoreError::Other(format!(
+            "no platform trust anchors for the database connection: {first}; \
+             set PGSSLROOTCERT or sslmode=disable"
+        )));
+    }
+    roots.add_parsable_certificates(native.certs);
+    Ok(roots)
+}
+
 /// Build a tokio-postgres config from the standard PG* environment
 /// variables, or parse an explicit DSN.
 pub fn pg_config(dsn: Option<&str>) -> Result<tokio_postgres::Config, StoreError> {
@@ -174,21 +585,55 @@ pub fn pg_config(dsn: Option<&str>) -> Result<tokio_postgres::Config, StoreError
 }
 
 impl Store {
+    /// Connect using the SSL policy from `PGSSLMODE` (default `prefer`).
     pub async fn connect(
         cfg: tokio_postgres::Config,
         map: Arc<RelMap>,
     ) -> Result<Self, StoreError> {
-        let mgr = Manager::from_config(
-            cfg,
-            NoTls,
-            ManagerConfig {
-                recycling_method: RecyclingMethod::Fast,
-            },
-        );
+        Self::connect_with(cfg, map, SslPolicy::from_env()?).await
+    }
+
+    /// Connect with an explicit SSL policy (spec O10.7).
+    pub async fn connect_with(
+        cfg: tokio_postgres::Config,
+        map: Arc<RelMap>,
+        ssl: SslPolicy,
+    ) -> Result<Self, StoreError> {
+        Self::connect_full(cfg, map, ssl, None).await
+    }
+
+    /// Connect with an explicit SSL policy and pool size (spec O10.7, O10.8).
+    pub async fn connect_full(
+        mut cfg: tokio_postgres::Config,
+        map: Arc<RelMap>,
+        ssl: SslPolicy,
+        pool: Option<usize>,
+    ) -> Result<Self, StoreError> {
+        let mgr_cfg = ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        };
+        let mgr = match ssl {
+            SslPolicy::Disable => {
+                cfg.ssl_mode(tokio_postgres::config::SslMode::Disable);
+                Manager::from_config(cfg, NoTls, mgr_cfg)
+            }
+            SslPolicy::Prefer | SslPolicy::Require => {
+                cfg.ssl_mode(if ssl == SslPolicy::Require {
+                    tokio_postgres::config::SslMode::Require
+                } else {
+                    tokio_postgres::config::SslMode::Prefer
+                });
+                let tls_cfg = rustls::ClientConfig::builder()
+                    .with_root_certificates(root_store()?)
+                    .with_no_client_auth();
+                let connector = tokio_postgres_rustls::MakeRustlsConnect::new(tls_cfg);
+                Manager::from_config(cfg, connector, mgr_cfg)
+            }
+        };
         // A bounded wait: exhaustion surfaces as 503 + Retry-After at the
         // API layer instead of queueing unboundedly (spec O10.3).
         let pool = Pool::builder(mgr)
-            .max_size(16)
+            .max_size(pool_size(pool))
             .wait_timeout(Some(std::time::Duration::from_secs(2)))
             .runtime(deadpool_postgres::Runtime::Tokio1)
             .build()
@@ -297,6 +742,18 @@ impl Store {
         // Diff tables and columns by name across all resources.
         use std::collections::HashMap;
         let mut adds: Vec<String> = Vec::new();
+        // Objects the per-resource diff cannot see, because they are not in
+        // the relational map: the access log, the append-only guard, and the
+        // history audit envelope. Every statement is idempotent, so these are
+        // *reconciled* rather than diffed — applied every time, counted
+        // never, which keeps "a re-upgrade is a no-op" true.
+        let mut reconcile: Vec<String> = fhirpg_map::ddl::schema_wide_objects(s);
+        for rm in self.map.resources.values() {
+            if let Some((_, hist)) = rm.find_table(TableKind::History) {
+                reconcile.extend(fhirpg_map::ddl::history_audit_columns(s, &hist.name));
+                reconcile.push(fhirpg_map::ddl::append_only_trigger(s, &hist.name));
+            }
+        }
         let mut destructive: Vec<String> = Vec::new();
         let mut old_tables: HashMap<&str, &fhirpg_map::model::Table> = HashMap::new();
         for rm in old_map.resources.values() {
@@ -370,7 +827,15 @@ impl Store {
                 destructive.first().expect("non-empty")
             )));
         }
-        let all: Vec<&String> = adds.iter().chain(destructive.iter()).collect();
+        // Adds first: reconciliation touches history tables, and a resource
+        // type new in this artifact has no tables until `adds` creates them.
+        // Reconciling first would `ALTER TABLE` something that does not exist
+        // yet.
+        let all: Vec<&String> = adds
+            .iter()
+            .chain(reconcile.iter())
+            .chain(destructive.iter())
+            .collect();
         for chunk in all.chunks(100) {
             let tx = client.transaction().await?;
             let joined: Vec<String> = chunk.iter().map(|x| x.to_string()).collect();
@@ -394,10 +859,74 @@ impl Store {
                 &[&checksum, &new_hex, &self.map.fhir_version.as_str()],
             )
             .await?;
+        let folded = self.backfill_norm(&mut client).await?;
         Ok(UpgradeReport {
             additive: adds.len(),
             destructive: destructive.len(),
+            folded,
         })
+    }
+
+    /// Populate folded search columns (P6.6) for rows written before the
+    /// column existed, returning how many values were folded.
+    ///
+    /// An upgrade that added the column would otherwise leave it NULL on every
+    /// existing row, and a string search compares the folded column — so the
+    /// resources would silently stop matching. Silent under-return is the one
+    /// failure mode a clinical search must not have, so the backfill runs as
+    /// part of the upgrade rather than as a step an operator can forget.
+    ///
+    /// Folds distinct *values* rather than rows (a surname repeats across
+    /// patients), in bounded batches, and is resumable: each pass only looks
+    /// at rows still NULL, so an interrupted run resumes where it stopped.
+    async fn backfill_norm(
+        &self,
+        client: &mut deadpool_postgres::Client,
+    ) -> Result<usize, StoreError> {
+        const BATCH: usize = 1000;
+        let s = &self.map.schema;
+        let mut total = 0usize;
+        for rm in self.map.resources.values() {
+            for t in &rm.tables {
+                for (src, dst) in &t.norm_cols {
+                    let (tn, mut done) = (&t.name, false);
+                    while !done {
+                        let rows = client
+                            .query(
+                                &format!(
+                                    "SELECT DISTINCT \"{src}\" FROM \"{s}\".\"{tn}\" \
+                                     WHERE \"{dst}\" IS NULL AND \"{src}\" IS NOT NULL \
+                                     LIMIT {BATCH}"
+                                ),
+                                &[],
+                            )
+                            .await?;
+                        if rows.is_empty() {
+                            done = true;
+                            continue;
+                        }
+                        let vals: Vec<String> =
+                            rows.iter().map(|r| r.get::<_, String>(0)).collect();
+                        let folded: Vec<String> =
+                            vals.iter().map(|v| fhirpg_map::fold::fold(v)).collect();
+                        client
+                            .execute(
+                                &format!(
+                                    "UPDATE \"{s}\".\"{tn}\" AS t SET \"{dst}\" = v.f \
+                                     FROM (SELECT unnest($1::text[]) AS s, \
+                                                  unnest($2::text[]) AS f) v \
+                                     WHERE t.\"{src}\" = v.s AND t.\"{dst}\" IS NULL"
+                                ),
+                                &[&vals, &folded],
+                            )
+                            .await?;
+                        total += vals.len();
+                        done = vals.len() < BATCH;
+                    }
+                }
+            }
+        }
+        Ok(total)
     }
 
     /// Remove this version's schema entirely (tables dropped in chunks to
@@ -437,6 +966,36 @@ impl Store {
         self.put_if(resource, None).await
     }
 
+    /// Like [`Store::put_if`], recording who is responsible (spec M3.15).
+    pub async fn put_audited(
+        &self,
+        resource: &Value,
+        expected_version: Option<i64>,
+        audit: &Audit,
+    ) -> Result<PutOutcome, StoreError> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let out = self
+            .put_in_audited(&tx, resource, expected_version, audit)
+            .await?;
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    /// Like [`Store::delete`], recording who is responsible.
+    pub async fn delete_audited(
+        &self,
+        rtype: &str,
+        id: &str,
+        audit: &Audit,
+    ) -> Result<bool, StoreError> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let existed = self.delete_in_audited(&tx, rtype, id, audit).await?;
+        tx.commit().await?;
+        Ok(existed)
+    }
+
     /// Like [`Store::put`], but honoring an If-Match expectation: the write
     /// only proceeds when the stored version equals `expected_version`
     /// (0 = "must not exist yet").
@@ -445,26 +1004,37 @@ impl Store {
         resource: &Value,
         expected_version: Option<i64>,
     ) -> Result<PutOutcome, StoreError> {
-        let mut client = self.pool.get().await?;
-        let tx = client.transaction().await?;
-        let out = self.put_in(&tx, resource, expected_version).await?;
-        tx.commit().await?;
-        Ok(out)
+        self.put_audited(resource, expected_version, &Audit::unattributed())
+            .await
     }
 
     /// Run several writes as one all-or-nothing database transaction
     /// (FHIR transaction Bundles). Outcomes are returned in op order.
     pub async fn transact(&self, ops: &[TxOp]) -> Result<Vec<TxOutcome>, StoreError> {
+        self.transact_audited(ops, &Audit::unattributed()).await
+    }
+
+    /// [`Store::transact`], attributing every entry in the bundle to one
+    /// principal — a transaction is one act by one actor.
+    pub async fn transact_audited(
+        &self,
+        ops: &[TxOp],
+        audit: &Audit,
+    ) -> Result<Vec<TxOutcome>, StoreError> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
         let mut outcomes = Vec::with_capacity(ops.len());
         for op in ops {
             match op {
                 TxOp::Put { resource, expected } => {
-                    outcomes.push(TxOutcome::Put(self.put_in(&tx, resource, *expected).await?));
+                    outcomes.push(TxOutcome::Put(
+                        self.put_in_audited(&tx, resource, *expected, audit).await?,
+                    ));
                 }
                 TxOp::Delete { rtype, id } => {
-                    outcomes.push(TxOutcome::Delete(self.delete_in(&tx, rtype, id).await?));
+                    outcomes.push(TxOutcome::Delete(
+                        self.delete_in_audited(&tx, rtype, id, audit).await?,
+                    ));
                 }
             }
         }
@@ -473,11 +1043,12 @@ impl Store {
     }
 
     /// One create-or-update inside a caller-managed transaction.
-    async fn put_in(
+    async fn put_in_audited(
         &self,
         tx: &tokio_postgres::Transaction<'_>,
         resource: &Value,
         expected_version: Option<i64>,
+        audit: &Audit,
     ) -> Result<PutOutcome, StoreError> {
         let rtype = resource
             .get("resourceType")
@@ -535,14 +1106,8 @@ impl Store {
             .get(0);
         let version = old.unwrap_or(0).max(last_any.unwrap_or(0)) + 1;
         insert_shredded(tx, &self.map, rm, &id, version, &out).await?;
-        tx.execute(
-            &format!(
-                "INSERT INTO \"{s}\".\"{hist}\" (\"id\", \"version_id\", \"last_updated\", \"op\", \"resource\") \
-                 VALUES ($1, $2, now(), $3, ($4::text)::jsonb)"
-            ),
-            &[&id, &version, &(if old.is_some() { "U" } else { "C" }), &json],
-        )
-        .await?;
+        let op = if old.is_some() { "U" } else { "C" };
+        append_history(tx, s, &hist, &id, version, op, Some(&json), audit).await?;
         Ok(PutOutcome {
             id,
             version_id: version,
@@ -551,10 +1116,33 @@ impl Store {
     }
 
     /// Read the current version, reconstructed from the relational tables.
+    ///
+    /// The read spans one base table and every child table, so it MUST see a
+    /// single snapshot (spec R4.5): a concurrent write between the statements
+    /// would otherwise reconstruct a resource that never existed — base
+    /// columns from one version, child rows from the next.
     pub async fn get(&self, rtype: &str, id: &str) -> Result<Option<Got>, StoreError> {
+        let mut client = self.pool.get().await?;
+        let tx = snapshot(&mut client).await?;
+        let got = self.get_in(&tx, rtype, id).await?;
+        // Read-only: commit and rollback are equivalent, and commit is the
+        // cheaper signal that the snapshot is no longer needed.
+        tx.commit().await?;
+        Ok(got)
+    }
+
+    /// One reconstruction inside a caller-supplied snapshot. Callers that
+    /// read several resources (search materialization, export) share one
+    /// transaction so the whole page is consistent, not merely each row.
+    pub async fn get_in(
+        &self,
+        tx: &tokio_postgres::Transaction<'_>,
+        rtype: &str,
+        id: &str,
+    ) -> Result<Option<Got>, StoreError> {
         let rm = self.rm(rtype)?;
         let s = &self.map.schema;
-        let client = self.pool.get().await?;
+        let client = tx;
 
         let base = rm.base_table();
         let base_cols: String = base
@@ -695,6 +1283,31 @@ impl Store {
         }))
     }
 
+    /// Reconstruct several resources in **one** snapshot (spec R4.5).
+    ///
+    /// Search and export materialize a whole page this way, so the page is
+    /// internally consistent rather than merely each row being consistent
+    /// with itself. Results are returned in the order asked for; `None` means
+    /// the id was absent from the snapshot (a legal outcome for a search hit
+    /// deleted between the id query and materialization, and for a dangling
+    /// `_include` reference).
+    pub async fn get_all(
+        &self,
+        items: &[(String, String)],
+    ) -> Result<Vec<Option<Got>>, StoreError> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut client = self.pool.get().await?;
+        let tx = snapshot(&mut client).await?;
+        let mut out = Vec::with_capacity(items.len());
+        for (rtype, id) in items {
+            out.push(self.get_in(&tx, rtype, id).await?);
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+
     /// Whether an id is active, deleted, or unknown — the read path's 404
     /// vs 410 distinction.
     pub async fn status(&self, rtype: &str, id: &str) -> Result<ResourceStatus, StoreError> {
@@ -702,7 +1315,11 @@ impl Store {
         let s = &self.map.schema;
         let base = &rm.base_table().name;
         let hist = &rm.find_table(TableKind::History).expect("history").1.name;
-        let client = self.pool.get().await?;
+        // Base and history are two statements: without one snapshot, a delete
+        // landing between them reports Unknown (404) for a resource whose
+        // history says Deleted (410).
+        let mut client = self.pool.get().await?;
+        let client = snapshot(&mut client).await?;
         if let Some(row) = client
             .query_opt(
                 &format!("SELECT \"version_id\" FROM \"{s}\".\"{base}\" WHERE \"id\" = $1"),
@@ -767,20 +1384,115 @@ impl Store {
         rows.into_iter().map(hist_entry).collect()
     }
 
-    /// Delete: removes current rows, appends a delete marker to history.
-    pub async fn delete(&self, rtype: &str, id: &str) -> Result<bool, StoreError> {
-        let mut client = self.pool.get().await?;
-        let tx = client.transaction().await?;
-        let existed = self.delete_in(&tx, rtype, id).await?;
-        tx.commit().await?;
-        Ok(existed)
+    /// Conditional create (`If-None-Exist`), atomic against concurrent
+    /// requests with the same criteria (spec A7.10).
+    ///
+    /// Searching and then writing in two steps is a race: two concurrent
+    /// conditional creates with identical criteria both find nothing and both
+    /// create, which is how a patient ends up in the chart twice. The
+    /// criteria are hashed into a transaction-scoped advisory lock, so
+    /// same-criteria requests serialize while unrelated ones proceed freely,
+    /// and the match and the write share one transaction.
+    pub async fn conditional_create(
+        &self,
+        rtype: &str,
+        criteria: &[(String, String)],
+        resource: &Value,
+    ) -> Result<CondCreate, StoreError> {
+        self.conditional_create_audited(rtype, criteria, resource, &Audit::unattributed())
+            .await
     }
 
-    async fn delete_in(
+    /// [`Store::conditional_create`], recording who is responsible.
+    pub async fn conditional_create_audited(
+        &self,
+        rtype: &str,
+        criteria: &[(String, String)],
+        resource: &Value,
+        audit: &Audit,
+    ) -> Result<CondCreate, StoreError> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let ids = self.locked_match(&tx, rtype, criteria).await?;
+        let out = match ids.len() {
+            0 => CondCreate::Created(self.put_in_audited(&tx, resource, Some(0), audit).await?),
+            1 => CondCreate::Existing(ids.into_iter().next().expect("one")),
+            _ => CondCreate::Multiple,
+        };
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    /// Conditional delete, atomic on the same terms as
+    /// [`Store::conditional_create`].
+    pub async fn conditional_delete(
+        &self,
+        rtype: &str,
+        criteria: &[(String, String)],
+    ) -> Result<CondDelete, StoreError> {
+        self.conditional_delete_audited(rtype, criteria, &Audit::unattributed())
+            .await
+    }
+
+    /// [`Store::conditional_delete`], recording who is responsible.
+    pub async fn conditional_delete_audited(
+        &self,
+        rtype: &str,
+        criteria: &[(String, String)],
+        audit: &Audit,
+    ) -> Result<CondDelete, StoreError> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let ids = self.locked_match(&tx, rtype, criteria).await?;
+        let out = match ids.len() {
+            0 => CondDelete::NoMatch,
+            1 => {
+                self.delete_in_audited(&tx, rtype, &ids[0], audit).await?;
+                CondDelete::Deleted
+            }
+            _ => CondDelete::Multiple,
+        };
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    /// Take the criteria lock, then match — inside the caller's transaction.
+    /// At most two ids are fetched: the interactions only distinguish none,
+    /// one, and more than one.
+    async fn locked_match(
+        &self,
+        tx: &tokio_postgres::Transaction<'_>,
+        rtype: &str,
+        criteria: &[(String, String)],
+    ) -> Result<Vec<String>, StoreError> {
+        let rm = self.rm(rtype)?;
+        let q = search::build_search_sql(&self.map, rm, criteria, 2, 0, &[], None)?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&criteria_lock_key(&self.map.schema, rtype, criteria)],
+        )
+        .await?;
+        let refs: Vec<&(dyn ToSql + Sync)> =
+            q.binds.iter().map(|b| b as &(dyn ToSql + Sync)).collect();
+        Ok(tx
+            .query(&q.sql, &refs)
+            .await?
+            .iter()
+            .map(|r| r.get(0))
+            .collect())
+    }
+
+    /// Delete: removes current rows, appends a delete marker to history.
+    pub async fn delete(&self, rtype: &str, id: &str) -> Result<bool, StoreError> {
+        self.delete_audited(rtype, id, &Audit::unattributed()).await
+    }
+
+    async fn delete_in_audited(
         &self,
         tx: &tokio_postgres::Transaction<'_>,
         rtype: &str,
         id: &str,
+        audit: &Audit,
     ) -> Result<bool, StoreError> {
         let rm = self.rm(rtype)?;
         let s = &self.map.schema;
@@ -809,14 +1521,7 @@ impl Store {
         )
         .await?;
         let version = old + 1;
-        tx.execute(
-            &format!(
-                "INSERT INTO \"{s}\".\"{hist}\" (\"id\", \"version_id\", \"last_updated\", \"op\", \"resource\") \
-                 VALUES ($1, $2, now(), 'D', NULL)"
-            ),
-            &[&id, &version],
-        )
-        .await?;
+        append_history(tx, s, &hist, id, version, "D", None, audit).await?;
         Ok(true)
     }
 
@@ -865,7 +1570,10 @@ impl Store {
     ) -> Result<SearchOutcome, StoreError> {
         let rm = self.rm(rtype)?;
         let q = search::build_search_sql(&self.map, rm, params, count, offset, sort, after_id)?;
-        let client = self.pool.get().await?;
+        // Page and count are two statements; one snapshot keeps `_total`
+        // consistent with the page it describes (spec R4.5).
+        let mut client = self.pool.get().await?;
+        let client = snapshot(&mut client).await?;
         let refs: Vec<&(dyn ToSql + Sync)> =
             q.binds.iter().map(|b| b as &(dyn ToSql + Sync)).collect();
         let rows = client.query(&q.sql, &refs).await?;
@@ -882,6 +1590,381 @@ impl Store {
             None
         };
         Ok(SearchOutcome { ids, total })
+    }
+
+    /// Append one disclosure record (spec PR12.5).
+    ///
+    /// Reads are the interactions an audit asks about first, and they leave
+    /// no other trace: nothing in the resource changes when someone looks at
+    /// it.
+    pub async fn log_access(&self, rec: &AccessRecord) -> Result<(), StoreError> {
+        let s = &self.map.schema;
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO \"{s}\".\"fhirpg_access_log\" \
+                       (\"request_id\", \"actor\", \"actor_source\", \"client\", \
+                        \"interaction\", \"rtype\", \"id\", \"version_id\", \
+                        \"outcome\", \"result_count\", \"reason\") \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"
+                ),
+                &[
+                    &rec.audit.request_id,
+                    &rec.audit.actor,
+                    &rec.audit.actor_source,
+                    &rec.audit.client,
+                    &rec.interaction,
+                    &rec.rtype,
+                    &rec.id,
+                    &rec.version_id,
+                    &rec.outcome,
+                    &rec.result_count,
+                    &rec.audit.reason,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Append many access records in one statement (PR12.6).
+    ///
+    /// One `INSERT` per disclosure costs a pool connection and a round trip on
+    /// the read path, which is the price of the synchronous mode. Batching
+    /// amortizes that: the arrays are unnested server-side, so a hundred
+    /// records cost one round trip instead of a hundred.
+    ///
+    /// All-or-nothing by construction — a single statement either appends
+    /// every record or none — so a partially written batch cannot leave the
+    /// log claiming fewer disclosures than happened.
+    pub async fn log_access_batch(&self, recs: &[AccessRecord]) -> Result<(), StoreError> {
+        if recs.is_empty() {
+            return Ok(());
+        }
+        let s = &self.map.schema;
+        let request_id: Vec<Option<&str>> =
+            recs.iter().map(|r| r.audit.request_id.as_deref()).collect();
+        let actor: Vec<&str> = recs.iter().map(|r| r.audit.actor.as_str()).collect();
+        let actor_source: Vec<Option<&str>> = recs
+            .iter()
+            .map(|r| r.audit.actor_source.as_deref())
+            .collect();
+        let client: Vec<Option<&str>> = recs.iter().map(|r| r.audit.client.as_deref()).collect();
+        let interaction: Vec<&str> = recs.iter().map(|r| r.interaction.as_str()).collect();
+        let rtype: Vec<Option<&str>> = recs.iter().map(|r| r.rtype.as_deref()).collect();
+        let id: Vec<Option<&str>> = recs.iter().map(|r| r.id.as_deref()).collect();
+        let version_id: Vec<Option<i64>> = recs.iter().map(|r| r.version_id).collect();
+        let outcome: Vec<&str> = recs.iter().map(|r| r.outcome.as_str()).collect();
+        let result_count: Vec<Option<i64>> = recs.iter().map(|r| r.result_count).collect();
+        let reason: Vec<Option<&str>> = recs.iter().map(|r| r.audit.reason.as_deref()).collect();
+        let client_conn = self.pool.get().await?;
+        client_conn
+            .execute(
+                &format!(
+                    "INSERT INTO \"{s}\".\"fhirpg_access_log\" \
+                       (\"request_id\", \"actor\", \"actor_source\", \"client\", \
+                        \"interaction\", \"rtype\", \"id\", \"version_id\", \
+                        \"outcome\", \"result_count\", \"reason\") \
+                     SELECT * FROM unnest($1::text[], $2::text[], $3::text[], \
+                       $4::text[], $5::text[], $6::text[], $7::text[], \
+                       $8::bigint[], $9::text[], $10::bigint[], $11::text[])"
+                ),
+                &[
+                    &request_id,
+                    &actor,
+                    &actor_source,
+                    &client,
+                    &interaction,
+                    &rtype,
+                    &id,
+                    &version_id,
+                    &outcome,
+                    &result_count,
+                    &reason,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Erase one resource and its history (GDPR Art. 17, spec M3.18).
+    ///
+    /// This is the one sanctioned exception to append-only history, and it is
+    /// explicit rather than quiet: the resource's history rows are removed and
+    /// replaced by a single tombstone recording who erased it, when, why, and
+    /// the `row_hash` the chain ended on. An erased record therefore leaves a
+    /// *verifiable hole* — `verify-audit` can still show that a chain existed
+    /// and was deliberately terminated — rather than looking like a chain that
+    /// never happened.
+    ///
+    /// What this cannot do is un-say the data: backups, replicas, and WAL
+    /// archives still hold it until they age out. The book says so plainly;
+    /// a deployment promising erasure has to mean the whole estate.
+    pub async fn purge(
+        &self,
+        rtype: &str,
+        id: &str,
+        audit: &Audit,
+    ) -> Result<PurgeReport, StoreError> {
+        let rm = self.rm(rtype)?;
+        let s = &self.map.schema;
+        let base = &rm.base_table().name;
+        let hist = rm
+            .find_table(TableKind::History)
+            .expect("history")
+            .1
+            .name
+            .clone();
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        // Scoped to this transaction: the guard refuses history DELETEs
+        // everywhere else (M3.17).
+        tx.batch_execute("SET LOCAL fhirpg.erasure = 'on'").await?;
+
+        let last = tx
+            .query_opt(
+                &format!(
+                    "SELECT \"version_id\", \"row_hash\" FROM \"{s}\".\"{hist}\" \
+                     WHERE \"id\" = $1 ORDER BY \"version_id\" DESC LIMIT 1"
+                ),
+                &[&id],
+            )
+            .await?;
+        let Some(last) = last else {
+            return Ok(PurgeReport {
+                versions_erased: 0,
+                existed: false,
+            });
+        };
+        let last_version: i64 = last.get(0);
+        let terminated_hash: Option<Vec<u8>> = last.get(1);
+
+        // Current rows first: the child tables cascade from the base row.
+        tx.execute(
+            &format!("DELETE FROM \"{s}\".\"{base}\" WHERE \"id\" = $1"),
+            &[&id],
+        )
+        .await?;
+        let erased = tx
+            .execute(
+                &format!("DELETE FROM \"{s}\".\"{hist}\" WHERE \"id\" = $1"),
+                &[&id],
+            )
+            .await?;
+
+        // The tombstone: op 'X', no resource, chained to the hash it ended on.
+        tx.execute(
+            &format!(
+                "INSERT INTO \"{s}\".\"{hist}\" \
+                   (\"id\", \"version_id\", \"last_updated\", \"op\", \"resource\", \
+                    \"actor\", \"actor_source\", \"client\", \"request_id\", \"reason\", \
+                    \"prev_hash\", \"row_hash\") \
+                 SELECT $1::text, $2::bigint, now(), 'X', NULL, \
+                        $3::text, $4::text, $5::text, $6::text, $7::text, $8::bytea, \
+                        sha256(convert_to($1::text || '|X|' || ($2::bigint)::text || '|' \
+                                          || $3::text, 'UTF8'))"
+            ),
+            &[
+                &id,
+                &(last_version + 1),
+                &audit.actor,
+                &audit.actor_source,
+                &audit.client,
+                &audit.request_id,
+                &audit.reason,
+                &terminated_hash,
+            ],
+        )
+        .await?;
+        tx.commit().await?;
+        tracing::warn!(
+            rtype,
+            id,
+            actor = %audit.actor,
+            reason = audit.reason.as_deref().unwrap_or("(none)"),
+            versions = erased,
+            "erased a resource and its history (GDPR Art. 17)"
+        );
+        Ok(PurgeReport {
+            versions_erased: erased,
+            existed: true,
+        })
+    }
+
+    /// Recompute every history hash chain and report the first break in each
+    /// (spec M3.16).
+    ///
+    /// Recomputation happens in SQL with the same expression the writer used,
+    /// so this checks the stored bytes rather than a Rust-side idea of them.
+    /// Rows written before the audit columns existed carry a null `row_hash`;
+    /// they are reported as the point the chain begins, not as tampering —
+    /// claiming a break where there is only history would train an operator
+    /// to ignore the report.
+    pub async fn verify_audit(&self) -> Result<Vec<ChainBreak>, StoreError> {
+        let s = &self.map.schema;
+        let client = self.pool.get().await?;
+        let mut breaks = Vec::new();
+        for rm in self.map.resources.values() {
+            let Some((_, hist)) = rm.find_table(TableKind::History) else {
+                continue;
+            };
+            let sql = format!(
+                "SELECT \"id\", \"version_id\", \
+                        (\"row_hash\" IS DISTINCT FROM \"expected\") AS bad, \
+                        (\"prev_hash\" IS DISTINCT FROM \"prior\") AS unlinked \
+                 FROM ( \
+                   SELECT h.\"id\", h.\"version_id\", h.\"row_hash\", h.\"prev_hash\", h.\"op\", \
+                          lag(h.\"row_hash\") OVER w AS prior, \
+                          sha256( \
+                            coalesce(lag(h.\"row_hash\") OVER w, \
+                              '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea) \
+                            || convert_to( \
+                                 h.\"id\" || '|' || h.\"version_id\"::text || '|' \
+                                 || h.\"last_updated\"::text || '|' || h.\"op\" || '|' \
+                                 || coalesce(h.\"resource\"::text, '') || '|' || h.\"actor\", \
+                                 'UTF8') \
+                          ) AS expected \
+                   FROM \"{s}\".\"{}\" h \
+                   WINDOW w AS (PARTITION BY h.\"id\" ORDER BY h.\"version_id\") \
+                 ) chain \
+                 WHERE \"row_hash\" IS NOT NULL \
+                   AND \"op\" <> 'X' \
+                   AND ((\"row_hash\" IS DISTINCT FROM \"expected\") \
+                        OR (\"prev_hash\" IS DISTINCT FROM \"prior\")) \
+                 ORDER BY \"id\", \"version_id\"",
+                hist.name
+            );
+            for row in client.query(&sql, &[]).await? {
+                let bad: Option<bool> = row.get(2);
+                let unlinked: Option<bool> = row.get(3);
+                breaks.push(ChainBreak {
+                    rtype: rm.name.clone(),
+                    id: row.get(0),
+                    version_id: row.get(1),
+                    detail: match (bad.unwrap_or(false), unlinked.unwrap_or(false)) {
+                        (true, true) => "row hash and link both differ".into(),
+                        (true, false) => "row contents differ from their hash".into(),
+                        _ => "link to the previous version differs".into(),
+                    },
+                });
+            }
+        }
+        Ok(breaks)
+    }
+
+    /// The audit envelope of every history row for one resource, oldest
+    /// first: `(version_id, actor, actor_source, client, request_id, reason)`.
+    ///
+    /// This is how an operator answers "who changed this record, and why".
+    #[allow(clippy::type_complexity)]
+    pub async fn raw_history_audit(
+        &self,
+        rtype: &str,
+        id: &str,
+    ) -> Result<
+        Vec<(
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>,
+        StoreError,
+    > {
+        let rm = self.rm(rtype)?;
+        let s = &self.map.schema;
+        let hist = &rm.find_table(TableKind::History).expect("history").1.name;
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT \"version_id\", \"actor\", \"actor_source\", \"client\", \
+                            \"request_id\", \"reason\" \
+                     FROM \"{s}\".\"{hist}\" WHERE \"id\" = $1 ORDER BY \"version_id\""
+                ),
+                &[&id],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5)))
+            .collect())
+    }
+
+    /// Disclosure records for one resource, oldest first:
+    /// `(actor, interaction, outcome)`.
+    ///
+    /// This is how an operator answers "who has looked at this patient".
+    pub async fn access_log_for(
+        &self,
+        rtype: &str,
+        id: &str,
+    ) -> Result<Vec<(String, String, String)>, StoreError> {
+        let s = &self.map.schema;
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT \"actor\", \"interaction\", \"outcome\" \
+                     FROM \"{s}\".\"fhirpg_access_log\" \
+                     WHERE \"rtype\" = $1 AND \"id\" = $2 ORDER BY \"seq\""
+                ),
+                &[&rtype, &id],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect())
+    }
+
+    /// Run arbitrary SQL against this schema. **Tests only** — it exists so
+    /// the audit suite can play the attacker with direct database access,
+    /// which is the threat the hash chain and the append-only trigger are
+    /// there to answer.
+    #[doc(hidden)]
+    pub async fn execute_raw_for_test(&self, sql: &str) -> Result<(), StoreError> {
+        let s = &self.map.schema;
+        let client = self.pool.get().await?;
+        client
+            .batch_execute(&format!("SET LOCAL search_path TO \"{s}\";\n{sql}"))
+            .await?;
+        Ok(())
+    }
+
+    /// `EXPLAIN` a compiled search under a **forced generic plan**, returning
+    /// the plan lines. **Tests only.**
+    ///
+    /// The generic plan is the point: it is the plan PostgreSQL reuses once a
+    /// statement has been executed a few times, and it is the one that cannot
+    /// see parameter values. A prefix search written as `LIKE $1` degrades to
+    /// a sequential scan there while looking fine in every hand-run `EXPLAIN`
+    /// with a literal — which is how the first attempt at P6.6 passed review
+    /// and would still have scanned the whole table in production.
+    #[doc(hidden)]
+    pub async fn explain_generic_for_test(
+        &self,
+        rtype: &str,
+        params: &[(String, String)],
+    ) -> Result<Vec<String>, StoreError> {
+        let rm =
+            self.map.resources.get(rtype).ok_or_else(|| {
+                StoreError::Unsupported(format!("unknown resource type {rtype:?}"))
+            })?;
+        let q = crate::search::build_search_sql(&self.map, rm, params, 100, 0, &[], None)?;
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        tx.batch_execute("SET LOCAL plan_cache_mode = force_generic_plan")
+            .await?;
+        let stmt = tx.prepare(&format!("EXPLAIN {}", q.sql)).await?;
+        let binds: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = q
+            .binds
+            .iter()
+            .map(|b| b as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = tx.query(&stmt, &binds).await?;
+        Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
     /// Whether this version's schema is installed in the database.

@@ -11,8 +11,11 @@ the `tls` build feature (`--tls-cert`/`--tls-key`, rustls).
 ## Health, metrics, logs
 
 - `/health` — liveness; `/ready` — database connectivity.
-- `/metrics` — Prometheus text: request totals, response classes,
-  cumulative latency.
+- `/metrics` — Prometheus text: request totals, response classes, and
+  `fhirpg_request_latency_seconds`, a histogram over the default 1ms–10s
+  buckets. It is a histogram rather than a running total because a mean
+  cannot distinguish "every request took 40ms" from "99% took 5ms and 1%
+  took 4 seconds"; `histogram_quantile` answers p99 from these buckets.
 - Every request gets an `X-Request-Id` (propagated when supplied) and one
   tracing line with method, path, and status. Resource content is never
   logged.
@@ -22,7 +25,24 @@ the `tls` build feature (`--tls-cert`/`--tls-key`, rustls).
 Server-side `statement_timeout` defaults to 30 s
 (`FHIRPG_STATEMENT_TIMEOUT_MS`); pool waits are bounded at 2 s, and
 exhaustion answers **503 + Retry-After** instead of queueing unboundedly.
-`fhirpg serve` shuts down gracefully on SIGINT/SIGTERM.
+`fhirpg serve` shuts down gracefully on SIGINT/SIGTERM, draining any queued
+disclosure records before it exits.
+
+Every edge ceiling is a flag, because the right value depends on the
+deployment:
+
+| Flag | Default | Bounds |
+| --- | --- | --- |
+| `--request-timeout` | 60 s | Wall clock for one request |
+| `--max-concurrent` | 256 | Requests in flight before shedding |
+| `--max-body-mb` | 32 | Request body size |
+| `--max-count` | 1000 | `_count`, whatever the client asks |
+| `--max-included` | 1000 | `_include`/`_revinclude` expansion; truncation is reported in the bundle |
+| `--pool-size` | 16 | Database connections. Overrides `FHIRPG_POOL_SIZE` |
+
+`--max-concurrent` sits deliberately above the pool size, so pool exhaustion
+stays the usual back-pressure signal and the concurrency limit is the
+backstop behind it.
 
 ## Install and upgrade
 
@@ -37,6 +57,13 @@ destructive (dropped tables or columns) is refused without
 `--allow-destructive`; column type changes always demand a manual
 migration. `fhirpg drop --yes` removes a version schema in lock-safe
 chunks.
+
+An upgrade that adds folded search columns also **backfills** them before
+it returns, and reports how many values it folded. This is not optional
+tidying: string search compares the folded column, so an upgrade that left
+it NULL would answer searches with fewer results and no error at all. The
+backfill folds distinct values in batches and is resumable — if it is
+interrupted, rerunning `--upgrade` continues where it stopped.
 
 ## Backup
 

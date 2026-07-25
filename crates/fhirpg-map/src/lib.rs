@@ -3,6 +3,7 @@
 
 pub mod ddl;
 pub mod error;
+pub mod fold;
 pub mod model;
 pub mod reconstruct;
 pub mod shred;

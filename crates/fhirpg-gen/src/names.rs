@@ -40,6 +40,14 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// A registry that already considers `names` taken. Used by passes that
+    /// add columns to a table built earlier, so they cannot reuse a name.
+    pub fn seeded<'a>(names: impl Iterator<Item = &'a str>) -> Self {
+        Self {
+            used: names.map(str::to_string).collect(),
+        }
+    }
+
     pub fn claim(&mut self, full: &str) -> String {
         let name = fit(full);
         let name = if self.used.contains(&name) {

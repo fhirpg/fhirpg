@@ -12,6 +12,7 @@ pub fn col_sql(ty: ColTy) -> &'static str {
         ColTy::BigInt => "bigint",
         ColTy::Numeric => "numeric",
         ColTy::Text => "text",
+        ColTy::TextC => "text COLLATE \"C\"",
         ColTy::Date => "date",
         ColTy::Timestamptz => "timestamptz",
         ColTy::Jsonb => "jsonb",
@@ -32,13 +33,165 @@ pub fn ddl_in(map: &RelMap, schema: &str) -> Vec<String> {
     out.push(format!(
         "CREATE TABLE \"{s}\".\"fhirpg_meta\" (\"key\" text PRIMARY KEY, \"value\" text NOT NULL)"
     ));
+    out.extend(schema_wide_objects(s));
     for rm in map.resources.values() {
         for t in &rm.tables {
             out.push(create_table(s, rm, t));
+            if t.kind == TableKind::History {
+                out.push(append_only_trigger(s, &t.name));
+            }
         }
         out.extend(search_indexes(s, rm));
     }
     out
+}
+
+/// Objects that exist once per schema rather than once per resource, written
+/// idempotently so that `init` and `init --upgrade` can both apply them.
+///
+/// The per-resource table diff in the store cannot see these — they are not
+/// in the relational map — so an upgrade applies them explicitly.
+#[must_use]
+pub fn schema_wide_objects(s: &str) -> Vec<String> {
+    let mut out = vec![access_log_table(s)];
+    out.extend(access_log_indexes(s));
+    out.push(append_only_guard(s));
+    out
+}
+
+/// The name of the search-normalization function (spec P6.6).
+pub const NORM_FN: &str = "fhirpg_norm";
+
+/// Fold a string for searching: Unicode-normalize, strip accents, lowercase.
+///
+/// FHIR requires string search to ignore case **and** accents. `ILIKE` gets
+/// the first and not the second, so "Muller" misses "Müller" and an `é`
+/// typed as `e` + combining acute misses one typed as a single codepoint —
+/// in a system serving Ærø, Muñoz, and Ślusarczyk, that is a patient not
+/// found rather than a cosmetic difference.
+///
+/// The function must be `IMMUTABLE` to be indexable, which is why `unaccent`
+/// is called in its two-argument form naming the dictionary explicitly: the
+/// one-argument form is only `STABLE`.
+#[must_use]
+pub fn norm_function(s: &str, have_unaccent: bool) -> String {
+    let body = if have_unaccent {
+        "SELECT lower(public.unaccent('public.unaccent', normalize($1, NFC)))"
+    } else {
+        // Fallback when the extension is unavailable (managed providers vary
+        // in whether an unprivileged role may create it). Covers Latin-1 and
+        // Latin Extended-A, which is most European name data; anything
+        // outside it folds to case only, which is what `ILIKE` did before.
+        "SELECT lower(translate(normalize($1, NFC), \
+         'ÀÁÂÃÄÅÇÈÉÊËÌÍÎÏÑÒÓÔÕÖÙÚÛÜÝàáâãäåçèéêëìíîïñòóôõöùúûüýÿ\
+          ĀāĂăĄąĆćĈĉĊċČčĎďĒēĔĕĖėĘęĚěĜĝĞğĠġĢģĤĥĨĩĪīĬĭĮįİĴĵĶķĹĺĻļĽľŃńŅņŇňŌōŎŏŐő\
+          ŔŕŖŗŘřŚśŜŝŞşŠšŢţŤťŨũŪūŬŭŮůŰűŲųŴŵŶŷŸŹźŻżŽž', \
+         'AAAAAACEEEEIIIINOOOOOUUUUYaaaaaaceeeeiiiinooooouuuuyy\
+          AaAaAaCcCcCcCcDdEeEeEeEeEeGgGgGgGgHhIiIiIiIiIJjKkLlLlLlNnNnNnOoOoOo\
+          RrRrRrSsSsSsSsTtTtUuUuUuUuUuUuWwYyYZzZzZz'))"
+    };
+    format!(
+        "CREATE OR REPLACE FUNCTION \"{s}\".\"{NORM_FN}\"(text) RETURNS text \
+         AS $$ {body} $$ LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT"
+    )
+}
+
+/// `ADD COLUMN IF NOT EXISTS` for a history table's audit envelope, so an
+/// installed schema gains M3.15/M3.16 without a rewrite. Purely additive:
+/// existing rows get `actor = 'unauthenticated'` and a null chain, which
+/// `verify-audit` reports as "chain starts here", not as a break.
+#[must_use]
+pub fn history_audit_columns(schema: &str, table: &str) -> Vec<String> {
+    [
+        ("actor", "text NOT NULL DEFAULT 'unauthenticated'"),
+        ("actor_source", "text"),
+        ("client", "text"),
+        ("request_id", "text"),
+        ("reason", "text"),
+        ("prev_hash", "bytea"),
+        ("row_hash", "bytea"),
+    ]
+    .iter()
+    .map(|(name, ty)| {
+        format!("ALTER TABLE \"{schema}\".\"{table}\" ADD COLUMN IF NOT EXISTS \"{name}\" {ty}")
+    })
+    .collect()
+}
+
+/// The disclosure log (PR12.5): one row per read, not per change.
+///
+/// A store that records only mutations cannot answer "who looked at this
+/// patient", which is the question an audit actually starts with.
+fn access_log_table(s: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS \"{s}\".\"fhirpg_access_log\" (\n\
+         \x20 \"seq\" bigserial PRIMARY KEY,\n\
+         \x20 \"ts\" timestamptz NOT NULL DEFAULT now(),\n\
+         \x20 \"request_id\" text,\n\
+         \x20 \"actor\" text NOT NULL,\n\
+         \x20 \"actor_source\" text,\n\
+         \x20 \"client\" text,\n\
+         \x20 \"interaction\" text NOT NULL,\n\
+         \x20 \"rtype\" text,\n\
+         \x20 \"id\" text,\n\
+         \x20 \"version_id\" bigint,\n\
+         \x20 \"outcome\" text NOT NULL,\n\
+         \x20 \"result_count\" bigint,\n\
+         \x20 \"reason\" text\n\
+         )"
+    )
+}
+
+fn access_log_indexes(s: &str) -> Vec<String> {
+    // The three questions an auditor asks: what happened to this patient,
+    // what did this person see, and what happened in this window.
+    vec![
+        format!(
+            "CREATE INDEX IF NOT EXISTS \"fhirpg_access_log_subject_ix\" ON \"{s}\".\"fhirpg_access_log\" (\"rtype\", \"id\", \"ts\")"
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS \"fhirpg_access_log_actor_ix\" ON \"{s}\".\"fhirpg_access_log\" (\"actor\", \"ts\")"
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS \"fhirpg_access_log_ts_ix\" ON \"{s}\".\"fhirpg_access_log\" (\"ts\")"
+        ),
+    ]
+}
+
+/// The function every history table's trigger calls (M3.17).
+///
+/// History is append-only in the database, not merely by convention: an
+/// application bug cannot rewrite it, and escaping this is a deliberate DBA
+/// act (`ALTER TABLE … DISABLE TRIGGER`) that leaves its own trace.
+fn append_only_guard(s: &str) -> String {
+    // UPDATE is never permitted: there is no legitimate reason to rewrite a
+    // history row in place.
+    //
+    // DELETE is permitted only inside a transaction that has set
+    // `fhirpg.erasure`, which is how `fhirpg purge` performs a GDPR Art. 17
+    // erasure (M3.18) — and which leaves a tombstone naming who did it. The
+    // guard is therefore not a defence against the application itself, which
+    // can set the flag; it is a defence against the far likelier accident of
+    // ordinary code, a migration, or a stray `DELETE` touching history at all.
+    format!(
+        "CREATE OR REPLACE FUNCTION \"{s}\".\"fhirpg_history_is_append_only\"() RETURNS trigger AS $$\n\
+         BEGIN\n\
+         \x20 IF TG_OP = 'DELETE' AND coalesce(current_setting('fhirpg.erasure', true), '') = 'on' THEN\n\
+         \x20   RETURN OLD;\n\
+         \x20 END IF;\n\
+         \x20 RAISE EXCEPTION 'fhirpg: % on %.% is forbidden; history is append-only (spec M3.17)',\n\
+         \x20   TG_OP, TG_TABLE_SCHEMA, TG_TABLE_NAME;\n\
+         END;\n\
+         $$ LANGUAGE plpgsql"
+    )
+}
+
+pub fn append_only_trigger(s: &str, table: &str) -> String {
+    let name = index_name(table, &["append_only_trg"]);
+    format!(
+        "CREATE OR REPLACE TRIGGER \"{name}\" BEFORE UPDATE OR DELETE ON \"{s}\".\"{table}\" \
+         FOR EACH ROW EXECUTE FUNCTION \"{s}\".\"fhirpg_history_is_append_only\"()"
+    )
 }
 
 /// One index per distinct search-target column set (P6.4). Index names share
@@ -51,7 +204,10 @@ pub fn search_indexes(schema: &str, rm: &ResourceMap) -> Vec<String> {
     for def in &rm.search {
         for t in &def.targets {
             let cols: Vec<&str> = match &t.kind {
-                TargetKind::Str { col } | TargetKind::Number { col } | TargetKind::Uri { col } => {
+                // Index the folded column when there is one: it is what every
+                // modifier except `:exact` actually compares.
+                TargetKind::Str { col, norm } => vec![norm.as_deref().unwrap_or(col)],
+                TargetKind::Number { col } | TargetKind::Uri { col } => {
                     vec![col]
                 }
                 TargetKind::Token { system, code } => match system {
@@ -156,6 +312,10 @@ pub fn create_table(schema: &str, rm: &ResourceMap, t: &Table) -> String {
             );
         }
         TableKind::History => {
+            // The audit envelope (M3.15) and the hash chain (M3.16) live on
+            // the same row as the change they describe, written by the same
+            // statement inside the same transaction: an audit record that can
+            // be lost independently of its change is not an audit record.
             let _ = write!(
                 sql,
                 "  \"id\" text NOT NULL,\n\
@@ -163,6 +323,13 @@ pub fn create_table(schema: &str, rm: &ResourceMap, t: &Table) -> String {
                  \x20 \"last_updated\" timestamptz NOT NULL,\n\
                  \x20 \"op\" char(1) NOT NULL,\n\
                  \x20 \"resource\" jsonb,\n\
+                 \x20 \"actor\" text NOT NULL DEFAULT 'unauthenticated',\n\
+                 \x20 \"actor_source\" text,\n\
+                 \x20 \"client\" text,\n\
+                 \x20 \"request_id\" text,\n\
+                 \x20 \"reason\" text,\n\
+                 \x20 \"prev_hash\" bytea,\n\
+                 \x20 \"row_hash\" bytea,\n\
                  \x20 PRIMARY KEY (\"id\", \"version_id\")"
             );
         }

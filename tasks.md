@@ -126,6 +126,13 @@ criterion. Order within a milestone is roughly dependency order.
 
 ## M5 — R4 and R3
 
+> **Ledger drift, needs a human call.** T21 and T22 are unchecked, but T7
+> records a full-corpus live round trip of 7,396/7,396 across r3/r4/r5, the
+> README claims all three corpora round-trip losslessly, and `fhirpg serve`
+> mounts all three (T23, checked). Either the boxes are stale or the README
+> overstates. Since the spec is meant to be the source of truth, reconcile
+> before release rather than after.
+
 - [ ] **T21 R4 artifacts.** Run generator on 4.0.1; fix spec-parsing deltas.
   *Accept:* full R4 examples corpus round-trips live; REST suite green on
   `/r4`.
@@ -140,9 +147,16 @@ criterion. Order within a milestone is roughly dependency order.
 
 - [x] **T-validate (V9.2).** `fhirpg load --validate` deserializes each
   resource through the typed `fhir` crate model behind the `validate`
-  build feature. R5 only for now: the published fhir 1.2.0 crate's r3/r4
-  features fail to compile (missing `fhir_version` macro import — bug to
-  fix upstream in fhir-rust-crate).
+  build feature. **All three versions**, since `fhir` 1.2.1.
+  *The upstream bug is fixed and released:* published 1.2.0 could not compile
+  its own r3/r4 features — the `Validate` derive expanded to `crate::r5::`
+  paths — but only for crates.io consumers, since the repository resolves the
+  derive macro through its `path` dependency where the fix already lived. It
+  needed `fhir-derive-macros` 1.0.1 published alongside `fhir` 1.2.1; a
+  `fhir` release on its own would have pulled the same broken macro.
+  *Accept met:* `validate_tests` covers R3/R4/R5 and records the one thing
+  `--validate` does not catch (unknown elements — serde ignores them; the
+  shredder rejects them per D12).
 - [x] **T-graceful.** `fhirpg serve` shuts down cleanly on SIGINT/SIGTERM.
 - [~] **T24 Observability.** Done: /health, /ready, /metrics (Prometheus
   text: request/response-class/latency counters), X-Request-Id
@@ -183,3 +197,270 @@ criterion. Order within a milestone is roughly dependency order.
   *Remaining (human decisions):* pick the release version, publish the
   five crates in dependency order, tag; optionally add cargo-audit/deny
   to CI.
+
+## M7 — Trustworthy under load and under audit
+
+The gap between "works end to end" and "may hold patient data". Ordered by
+severity: P0 items are defects in what already ships, P1 items are missing
+guarantees, P2 items are reach.
+
+### P0 — defects in shipped behaviour
+
+- [x] **T31 Snapshot reads (R4.5).** `Store::get` reads the base row and
+  every child table as separate implicit transactions
+  (`fhirpg-store/src/lib.rs:554`), while `put_in` deletes and re-inserts
+  (`:512`). A write landing mid-read reconstructs a resource that never
+  existed. Wrap every multi-statement read in one
+  `REPEATABLE READ READ ONLY` transaction; same for `export` and search
+  materialization.
+  *Accept:* a reader loop against a writer loop over 10k iterations never
+  observes a torn resource and never errors (T11.6).
+- [x] **T32 Encrypted database transport (O10.7).** `NoTls` is hard-coded
+  (`fhirpg-store/src/lib.rs:186`), so PHI crosses to PostgreSQL in clear and
+  `sslmode=require` cannot be honored. Add `tokio-postgres-rustls`, honor
+  `sslmode`/`PGSSLROOTCERT`, default `prefer`, and refuse a non-loopback
+  `--bind` over an unencrypted connection without `--allow-insecure-db`.
+  *Done:* `SslPolicy`, rustls connector, `PGSSLROOTCERT` trust anchors,
+  `Store::connect_with`, the `serve` startup guard, and a startup warning
+  whenever the link is unencrypted. fhirpg's `require` validates the
+  certificate where libpq's does not — a documented deviation, in the safe
+  direction. The startup refusal is now split out as `refuse_insecure_db`
+  and tested as a policy table (`startup_guard_tests`), including the case
+  where the bind will not resolve — "I could not tell" must count as
+  not-loopback, or the check silently skips itself.
+  The live test against a TLS-only PostgreSQL now runs in CI
+  (`ci.yml`, `tls-database`): a `hostssl`-only server, with a step that first
+  proves plaintext really is refused — a gate that silently permits downgrade
+  tests nothing — then runs the live suite with `PGSSLMODE=require` and the
+  self-signed certificate as its own trust anchor.
+
+  *Remaining:* nothing on GitHub. There is no Woodpecker counterpart, because
+  Woodpecker starts services before workspace steps run, so a certificate
+  generated in a step does not exist when the database container boots; the
+  workarounds (a committed test key, or docker-in-docker) are each worse than
+  the gap. Recorded in `doc/ci.md` rather than left to be discovered.
+- [x] **T33 Atomic conditional interactions (A7.10).** `If-None-Exist`
+  searches then writes (`fhirpg-server/src/lib.rs:444`); two concurrent
+  identical conditional creates both create. Move match and write into one
+  transaction guarded by `pg_advisory_xact_lock` on the criteria hash; same
+  for conditional delete and conditional update.
+  *Done:* `Store::conditional_create`/`conditional_delete` take
+  `pg_advisory_xact_lock` on a sorted hash of the criteria, then match and
+  write in one transaction. *Accept met:* 8 racing conditional creates yield
+  exactly one resource and seven `Existing`. *Remaining:* conditional update
+  (the server does not implement it yet).
+- [x] **T34 Audit envelope on history (M3.15, PR12.1–PR12.4).** History
+  records no actor at all. Add the audit columns to the generated history
+  DDL, thread a `Principal` through the store write path, and extract it
+  from the configured trusted header behind `--trust-proxy`. Additive, so
+  `init --upgrade` migrates existing installs.
+  *Done:* `Audit` envelope threaded through `put_audited`/`delete_audited`/
+  `transact_audited`/`conditional_*_audited`; `PrincipalPolicy` on the
+  server honoring a configured header **only** behind `--trust-proxy`;
+  `--require-principal` → 401; CLI writes attributed to the operator
+  (`Audit::cli()`). Upgrade reconciles the new columns idempotently.
+  *Accept met:* the `audit` suite asserts all three, and that a plain `put`
+  records `unauthenticated` rather than nothing.
+- [x] **T35 Configured service base URL (A7.7).** Bundle `fullUrl` and
+  `link` are built from the `Host` header and hard-coded `http://`
+  (`fhirpg-server/src/lib.rs:739`). Add `--base-url`, honor forwarded
+  headers only under `--trust-proxy` with a host allowlist.
+  *Done:* `BaseUrl` with `--base-url`, `--trust-proxy`, `--allowed-host`;
+  the default emits URLs for the address actually bound and reads no request
+  header at all. *Remaining:* a test asserting a poisoned `Host` changes
+  nothing.
+- [x] **T36 Preconditions inside bundles (A7.9).** `parse_entries`
+  (`:888`) ignores `ifMatch`/`ifNoneExist`/`ifModifiedSince`. Honor them, or
+  fail the entry 501 — never accept-and-ignore. *Done:* `ifMatch` is honored
+  in batch and transaction entries (412 on mismatch, mapped as 412 rather
+  than a generic 400); `ifNoneExist`/`ifModifiedSince`/`ifNoneMatch` fail the
+  entry 501, and fail the whole bundle for a transaction.
+- [x] **T37 Reference rewriting precision.** `rewrite_refs` (`:1130`)
+  replaces any string equal to a `urn:uuid`, including narrative and
+  `valueString`. Restrict to `Reference.reference` values and
+  `Bundle.entry.fullUrl`. *Done:* only `reference` keys are rewritten.
+- [x] **T38 Resource id validation (R4.6).** No `[A-Za-z0-9\-\.]{1,64}`
+  check anywhere; ids from URL or body land in unbounded `text`.
+  *Done:* `valid_fhir_id` guards read, vread, history, update, delete, and
+  Bundle entry urls. *Remaining:* the same check inside `fhirpg load`.
+- [x] **T39 PHI response headers (A7.8).** `Cache-Control: no-store`,
+  `Pragma: no-cache`, `X-Content-Type-Options`, `Referrer-Policy`; CORS
+  denied unless `--cors-origin` names an origin. *Done:* the four headers are
+  set on every response. *Remaining:* `--cors-origin` (there is still no CORS
+  layer at all, which is closed rather than open).
+- [x] **T40 Diagnostics hygiene (A7.11).** `StoreError::Other` text is
+  reflected verbatim into OperationOutcomes (`:174`). Client-visible
+  diagnostics become path + rule id; detail goes to the log with the
+  incident id. *Done:* `StoreError` now distinguishes `Unsupported`
+  (client-safe: names the caller's own parameter) from `Other` (internal:
+  logged behind an incident id, never returned). Search-compilation errors
+  are `Unsupported`, so the honest "this parameter is not supported"
+  messages survive.
+
+### P1 — missing guarantees
+
+- [x] **T41 Access log (PR12.5, PR12.6).** `fhirpg_access_log` per schema;
+  every read, vread, history, and search appends a record naming the actor,
+  the subject, and (for search) how many resources were disclosed.
+  `--audit-mode sync|async|off`, bounded queue, fail closed on saturation,
+  per-version counters, `--allow-unaudited` to opt out loudly.
+
+  *On the default.* The spec draft had `async` as the default for
+  throughput; it ships as `sync`. The failure `sync` prevents is the one
+  that cannot be repaired afterwards — a disclosure with no record is
+  indistinguishable, later, from a disclosure that never happened — and a
+  fast default would make every deployment silently accept a loss window it
+  never chose. `async` announces that window at startup.
+
+  *Fail closed became real, not aspirational.* Recording used to be
+  best-effort: a failed insert was logged and the read served anyway. Now
+  `audit_read` returns a refusal that the four read paths propagate as 503,
+  so in every mode a disclosure that cannot be recorded is not made.
+
+  *Two bugs worth remembering, both in code that compiled and looked right.*
+  `Sender::closed()` waits for the *receiver* to drop, so using it to
+  shut the writer down deadlocks against the task it is waiting for; the
+  sender has to actually be dropped, which means holding it somewhere
+  takeable. And a queue-depth gauge maintained by read-then-subtract can
+  underflow under concurrency, so depth is derived from the monotonic
+  counters instead — an audit queue reporting a nonsense depth is worse than
+  one reporting none. `tests/audit_async.rs` pins both, the drain test under
+  a timeout so a deadlock fails instead of hanging the suite.
+
+- [x] **T42 Tamper-evident history (M3.16, M3.17).** `prev_hash`/`row_hash`
+  chain per resource id, `BEFORE UPDATE OR DELETE` reject triggers,
+  `fhirpg verify-audit` walking every chain, and the documented `REVOKE`
+  grants. *Done:* all of it. The chain is computed **in SQL** so it covers
+  the database's own `now()` and cannot race the read of the previous hash,
+  and it hashes `resource::jsonb::text` — the stored normalized form — since
+  hashing the submitted text would fail verification against what was
+  actually saved. *Accept met:* the `audit` suite tampers with a history row
+  behind the application's back and the chain names exactly that version.
+- [x] **T43 Worldwide string search (P6.6).** Each string search target
+  column gets a `_norm` companion holding the folded value, computed in Rust
+  at write time; prefix search is a range predicate against it. Closes T15's
+  unindexed-prefix note. No PostgreSQL extension required.
+
+  *Two traps, both found by measurement rather than reasoning.*
+
+  First: the cheap-looking version — an expression index on `fhirpg_norm(col)`
+  plus a predicate `fhirpg_norm(col) LIKE fhirpg_norm($1) || '%'` — **does not
+  use the index**. PostgreSQL's btree prefix optimization for `LIKE` needs a
+  *constant* pattern, and `fhirpg_norm($1)` is only stable, not constant.
+  Folding the term in Rust instead keeps the pattern constant, but then the
+  fold exists twice — once in Rust, once in SQL — and the two must agree for
+  every codepoint, forever, or a patient is simply not found. So the fold
+  lives in Rust only (`fhirpg-map::fold`), and the database stores its output.
+
+  Second, and the reason the first fix is not enough: even against a plain
+  column with a `text_pattern_ops` index, `col LIKE $1` **still** scans. The
+  prefix is extracted at plan time, so a custom plan (which substitutes
+  parameter values) uses the index and a generic plan does not — meaning the
+  query is fast in every hand-run `EXPLAIN` with a literal, fast for its first
+  few executions, and then quietly degrades once PostgreSQL switches to the
+  generic plan. The fix is to stop asking the planner to analyze a pattern at
+  all: compute the upper bound in Rust and emit `col >= $1 AND col < $2`, an
+  ordinary index condition. `tests/search_semantics.rs::string_prefix_search_uses_its_index`
+  pins this with `plan_cache_mode = force_generic_plan`, which is the only
+  setting under which the old form visibly fails.
+
+  Ordering is by `COLLATE "C"` — set on the column itself — because the range
+  bound is only sound under codepoint order. Under a linguistic collation a
+  string beginning with the prefix can sort past the computed upper bound.
+
+  `:exact` deliberately compares the *stored* column: it is defined as the
+  literal string, so folding must not leak into it.
+
+  Migration: `upgrade` adds the columns, then backfills them
+  (`Store::backfill_norm`) before returning. Without the backfill an upgraded
+  install would answer string searches from NULL columns and silently return
+  fewer results — the one failure mode a clinical search must not have. The
+  backfill folds distinct *values* rather than rows, in batches, and is
+  resumable, since each pass only looks at rows still NULL.
+
+- [x] **T44 Edge resource limits (O10.8, P6.7).** Per-request timeout,
+  concurrency limit, in-flight cap, configurable pool size; batched result
+  materialization instead of one `get` per id; `_include`/`_revinclude` caps
+  that warn in the bundle when they truncate. Every ceiling is now a flag —
+  `--request-timeout`, `--max-concurrent`, `--max-body-mb`, `--max-count`,
+  `--max-included`, `--pool-size` — rather than a constant compiled into the
+  binary, because the right value depends on the deployment and the previous
+  answer was "rebuild it".
+
+  `--pool-size` takes precedence over `FHIRPG_POOL_SIZE`: a flag the operator
+  typed should not be silently overridden by an environment variable they
+  inherited.
+
+  `tests/edge_limits.rs` asserts a configured ceiling is *enforced*, not just
+  parsed. A limit that reaches the config struct but never reaches the code
+  that should apply it is worse than no limit, because the operator believes
+  a ceiling exists.
+- [x] **T45 Admin plane separation (O10.9).** `--admin-bind` for
+  `/metrics`, `/health`, `/ready`; latency as a histogram so p99 is
+  answerable. *Done:* `--admin-bind` serves /health, /ready and /metrics on
+  their own address against the same counters, on their own task so they
+  answer while the API is shedding load, and latency is a Prometheus
+  histogram (`fhirpg_request_latency_seconds`, default 1ms–10s buckets) so
+  `histogram_quantile` answers p99. A running total plus a count gives only
+  the mean, and the mean cannot tell "every request took 40ms" from "99%
+  took 5ms and 1% took 4 seconds" — which is the case anyone is paged for.
+- [x] **T46 Honest CapabilityStatement (A7.12).** Declare
+  `conditionalCreate`/`Update`/`Delete`, `searchInclude`, `searchRevInclude`,
+  `readHistory`, `versioning`, and the `security` block; drop interactions
+  that are not implemented. *Done:* per-resource `versioning`, `readHistory`,
+  `updateCreate`, `conditionalCreate`/`Update`/`Delete`, `referencePolicy`,
+  `searchInclude`/`RevInclude`; system-level `transaction` and `batch`; and a
+  `security.description` stating plainly that fhirpg verifies no identity.
+- [x] **T47 Supply-chain evidence (O10.10).** `cargo deny` + `cargo audit`
+  in CI, CycloneDX SBOM per release, checksums for published artifacts.
+  *Done:* a `supply-chain` CI job (cargo-deny + CycloneDX, SBOM uploaded as
+  an artifact) and a `deny.toml` policy — permissive licences only, wildcards
+  denied, unknown registries denied. *Remaining:* per-binary checksums in the
+  release workflow.
+- [x] **T48 Concurrency, redaction, and audit test suites (T11.6–T11.8).**
+  The adversarial tests that keep T31–T42 honest. *Done:* `concurrency.rs`
+  covers torn reads, racing conditional creates, and racing `If-Match`
+  updates (T11.6); `redaction.rs` covers T11.7; `audit.rs` covers T11.8 —
+  the audit envelope, the disclosure record, chain verification, and the
+  database refusing to let history be rewritten. `audit_async.rs` adds the
+  async path: batching, the shutdown drain, and saturation refusing rather
+  than dropping.
+- [x] **T49 Erasure (M3.18).** `fhirpg purge` with tombstone rows,
+  `--allow-erasure`, and a test that `verify-audit` reports a purge as a
+  recorded hole rather than a chain break. *Done:* `Store::purge` and
+  `fhirpg purge`, the tombstone carrying who/when/why plus the terminated
+  chain hash, and the append-only trigger relaxed to permit `DELETE` only
+  inside a transaction that sets `fhirpg.erasure`. The book states the two
+  limits plainly: backups and replicas are outside this, and the guard stops
+  accidents rather than the application itself.
+- [x] **T50 Trust-boundary chapter (PR12.8).** One table in the book: what
+  fhirpg guarantees, what the perimeter must provide, what neither does yet.
+  *Done:* `book/src/trust-boundary.md`, including a worked `serve`
+  invocation where every flag is explained, the `REVOKE` grants, and an
+  honest statement of what the hash chain does *not* prove (an attacker who
+  can recompute it — hence: ship `row_hash` off-box).
+
+### P2 — reach
+
+- [ ] **T51 Type- and system-level `_history`.** Required for CDC,
+  replication, and incremental export; currently instance-level only.
+- [ ] **T52 Bulk Data `$export`.** Async kickoff, NDJSON output, status
+  polling — ONC/HTI expects it, and the earlier fhirpg had the client half.
+- [ ] **T53 `X-Provenance` and `AuditEvent` projection (PR12.7).** Store
+  submitted Provenance; expose the access log as queryable `AuditEvent`.
+- [ ] **T54 Inferno / Touchstone conformance run.** External validation of
+  §7 and A7.12 against the published test kits.
+- [ ] **T55 `_summary` and `_elements`.** Common in production clients;
+  currently 501.
+- [ ] **T56 PATCH.** JSON Patch and FHIRPath Patch, declared in the
+  CapabilityStatement.
+- [ ] **T57 Restore and failover drills.** A documented, tested PITR
+  restore and a `fhirpg fsck` that checks orphan rows, ordinal gaps, and
+  history/current agreement.
+- [x] **T58 CI/CD on GitHub and Codeberg.** Parallel pipelines on both
+  forges (`.github/workflows/`, `.woodpecker/`): fmt, clippy, unit tests,
+  book, live-PostgreSQL suite, advisories/licenses/SBOM. Tag builds
+  artifacts with checksums and a CycloneDX SBOM attached to the release;
+  crates.io publishing is manual and confirmation-gated, since a published
+  version can be yanked but never replaced. Also verifies the declared MSRV,
+  which until now was a claim nothing checked. See `doc/ci.md`.

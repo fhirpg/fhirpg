@@ -297,6 +297,7 @@ fn targets_for(
             etable,
             TargetKind::Str {
                 col: pc.col.clone(),
+                norm: None,
             },
         ),
         (ElemKind::Prim(pc), SearchTy::Uri) => one(
@@ -419,7 +420,7 @@ fn group_targets(
                 if let Some((t, col, _)) = prim_col(part) {
                     out.push(SearchTarget {
                         table: t,
-                        kind: TargetKind::Str { col },
+                        kind: TargetKind::Str { col, norm: None },
                     });
                 }
             }
@@ -433,6 +434,7 @@ fn group_targets(
                         table: t,
                         kind: TargetKind::Str {
                             col: pc.col.clone(),
+                            norm: None,
                         },
                     });
                 }
@@ -501,5 +503,82 @@ fn group_targets(
             Err(format!("no reference shape in {:?}", elem.json))
         }
         _ => Err(format!("cannot compile {ty:?} on complex {:?}", elem.json)),
+    }
+}
+
+/// Materialise the folded companion column for every `string` search target
+/// (P6.6).
+///
+/// Runs after search compilation, because only then is it known which columns
+/// a `string` parameter actually tests — folding every text column in the
+/// schema would roughly double it for no benefit. Each `(source, folded)` pair
+/// is recorded on the table so the shredder can fill it, and on the target so
+/// the query planner-facing predicate can use it.
+///
+/// Idempotent: a map already carrying folded columns is left unchanged, so
+/// regenerating does not append duplicates.
+pub fn add_norm_columns(map: &mut RelMap) {
+    use crate::names::Registry;
+    use fhirpg_map::model::{ColTy, Column};
+
+    for rm in map.resources.values_mut() {
+        // One registry per table, seeded with the names build.rs already
+        // claimed, so a folded column can never collide with a data column.
+        let mut regs: Vec<Registry> = rm
+            .tables
+            .iter()
+            .map(|t| Registry::seeded(t.cols.iter().map(|c| c.name.as_str())))
+            .collect();
+
+        // Collect first: `rm.search` and `rm.tables` cannot both be borrowed
+        // mutably at once.
+        let mut wanted: Vec<(u32, String)> = Vec::new();
+        for def in &rm.search {
+            for t in &def.targets {
+                if let TargetKind::Str { col, norm: None } = &t.kind {
+                    wanted.push((t.table, col.clone()));
+                }
+            }
+        }
+
+        // A column can back several parameters (Patient.name feeds both
+        // `name` and `phonetic`); fold it once.
+        let mut assigned: HashMap<(u32, String), String> = HashMap::new();
+        for (table, col) in wanted {
+            let key = (table, col.clone());
+            if assigned.contains_key(&key) {
+                continue;
+            }
+            let t = &mut rm.tables[table as usize];
+            if let Some((_, existing)) = t.norm_cols.iter().find(|(src, _)| *src == col) {
+                assigned.insert(key, existing.clone());
+                continue;
+            }
+            let path = t
+                .cols
+                .iter()
+                .find(|c| c.name == col)
+                .map(|c| c.path.clone())
+                .unwrap_or_default();
+            let name = regs[table as usize].claim(&format!("{col}_norm"));
+            t.cols.push(Column {
+                name: name.clone(),
+                ty: ColTy::TextC,
+                path,
+            });
+            t.norm_cols.push((col.clone(), name.clone()));
+            assigned.insert(key, name);
+        }
+
+        for def in &mut rm.search {
+            for t in &mut def.targets {
+                if let TargetKind::Str { col, norm } = &mut t.kind
+                    && norm.is_none()
+                    && let Some(n) = assigned.get(&(t.table, col.clone()))
+                {
+                    *norm = Some(n.clone());
+                }
+            }
+        }
     }
 }

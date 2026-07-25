@@ -27,7 +27,7 @@ struct Cli {
     cmd: Cmd,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum Ver {
     R3,
     R4,
@@ -42,6 +42,14 @@ impl Ver {
             Ver::R5 => "r5",
         }
     }
+}
+
+/// `--audit-mode` on the command line.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum AuditModeArg {
+    Sync,
+    Async,
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -95,6 +103,25 @@ enum Cmd {
         #[arg(long)]
         full: bool,
     },
+    /// Recompute every history hash chain and report any break (spec M3.16).
+    /// Exits nonzero if the audit trail has been tampered with.
+    VerifyAudit,
+    /// Erase a resource and its entire history (GDPR Art. 17, spec M3.18).
+    ///
+    /// This is the one sanctioned exception to append-only history. A
+    /// tombstone is left recording who erased it, when, and why. Backups and
+    /// replicas are NOT touched — erasure across the estate is the
+    /// deployment's job.
+    Purge {
+        rtype: String,
+        id: String,
+        /// Why the erasure was performed; recorded in the tombstone.
+        #[arg(long)]
+        reason: String,
+        /// Required acknowledgement.
+        #[arg(long)]
+        allow_erasure: bool,
+    },
     /// Show the rows one resource file shreds into, without a database.
     Transform { path: PathBuf },
     /// Drop this FHIR version's schema and ALL its data (tables are dropped
@@ -117,6 +144,83 @@ enum Cmd {
         /// PEM private key for in-process TLS.
         #[arg(long, requires = "tls_cert")]
         tls_key: Option<PathBuf>,
+        /// The service base URL this server is reached at, e.g.
+        /// `https://fhir.example.org`. Every absolute URL in a response —
+        /// Bundle fullUrl, paging links, Location — is built from it. Without
+        /// it the server emits URLs for the address it bound, and never
+        /// trusts a request header to decide (spec A7.7).
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Honor `X-Forwarded-Proto`/`-Host` from a fronting proxy. Only set
+        /// this when a proxy you control is the only way in: these headers
+        /// are otherwise attacker-controlled.
+        #[arg(long)]
+        trust_proxy: bool,
+        /// Hosts a trusted proxy may claim, repeatable. Empty means any,
+        /// which is why naming them is the better habit.
+        #[arg(long = "allowed-host")]
+        allowed_hosts: Vec<String>,
+        /// Serve without an encrypted database connection while bound to a
+        /// non-loopback address. Refused by default: binding to the network
+        /// and sending PHI to PostgreSQL in the clear is a decision, not an
+        /// accident (spec O10.7).
+        #[arg(long)]
+        allow_insecure_db: bool,
+        /// Header carrying the authenticated principal, set by the fronting
+        /// proxy — e.g. `X-Fhirpg-Principal`. Honored only with
+        /// --trust-proxy: without it any client could name itself anyone.
+        /// Every write records the principal; every read logs a disclosure
+        /// (spec §12).
+        #[arg(long)]
+        principal_header: Option<String>,
+        /// Header carrying a purpose of use, recorded alongside the actor.
+        #[arg(long)]
+        reason_header: Option<String>,
+        /// Reject requests that cannot be attributed to a principal (401).
+        /// Deployments handling PHI are expected to set this.
+        #[arg(long)]
+        require_principal: bool,
+        /// Stop recording who read what. Refused unless you also pass
+        /// --allow-unaudited, because an unlogged disclosure is the failure
+        /// this exists to prevent (spec PR12.6).
+        #[arg(long)]
+        no_audit_reads: bool,
+        /// Acknowledge running without read auditing.
+        #[arg(long)]
+        allow_unaudited: bool,
+        /// Wall-clock ceiling for one request, in seconds.
+        #[arg(long, default_value_t = 60)]
+        request_timeout: u64,
+        /// Requests allowed in flight at once before shedding with 503.
+        #[arg(long, default_value_t = 256)]
+        max_concurrent: usize,
+        /// Largest request body accepted, in megabytes.
+        #[arg(long, default_value_t = 32)]
+        max_body_mb: usize,
+        /// Ceiling on `_count`, whatever a client asks for.
+        #[arg(long, default_value_t = 1000)]
+        max_count: i64,
+        /// Ceiling on `_include`/`_revinclude` expansion for one search.
+        /// Exceeding it truncates and says so in the bundle.
+        #[arg(long, default_value_t = 1000)]
+        max_included: usize,
+        /// Database connection pool size. Overrides FHIRPG_POOL_SIZE.
+        #[arg(long)]
+        pool_size: Option<usize>,
+        /// How disclosure records reach the log. `sync` commits before
+        /// responding, so nothing is disclosed unrecorded, and every read
+        /// pays a round trip. `async` queues in memory and writes in
+        /// batches: faster, but records queued when the process dies are
+        /// lost. Either way a saturated queue refuses the read rather than
+        /// dropping the record (spec PR12.6).
+        #[arg(long, value_enum, default_value = "sync")]
+        audit_mode: AuditModeArg,
+        /// Serve /health, /ready, and /metrics on their own address, e.g.
+        /// `127.0.0.1:9090`. Without it they share the FHIR port, which
+        /// means anyone who can reach patient data can also read operational
+        /// metrics (spec O10.9).
+        #[arg(long)]
+        admin_bind: Option<String>,
     },
 }
 
@@ -272,14 +376,59 @@ async fn run_db(cli: Cli) -> Result<()> {
         ref bind,
         ref tls_cert,
         ref tls_key,
+        ref base_url,
+        trust_proxy,
+        ref allowed_hosts,
+        allow_insecure_db,
+        ref principal_header,
+        ref reason_header,
+        require_principal,
+        no_audit_reads,
+        allow_unaudited,
+        audit_mode,
+        request_timeout,
+        max_concurrent,
+        max_body_mb,
+        max_count,
+        max_included,
+        pool_size,
+        ref admin_bind,
     } = cli.cmd
     {
-        return serve(&cli, bind, tls_cert.as_deref(), tls_key.as_deref()).await;
+        let opts = ServeOpts {
+            bind,
+            tls_cert: tls_cert.as_deref(),
+            tls_key: tls_key.as_deref(),
+            base_url: base_url.clone(),
+            trust_proxy,
+            allowed_hosts: allowed_hosts.clone(),
+            allow_insecure_db,
+            principal_header: principal_header.clone(),
+            reason_header: reason_header.clone(),
+            require_principal,
+            no_audit_reads,
+            allow_unaudited,
+            audit_mode,
+            limits: fhirpg_server::Limits {
+                request_timeout: std::time::Duration::from_secs(request_timeout),
+                max_concurrent,
+                max_body: max_body_mb * 1024 * 1024,
+                max_count,
+                max_included,
+            },
+            pool_size,
+            admin_bind: admin_bind.clone(),
+        };
+        return serve(&cli, &opts).await;
     }
     let schema = cli.fhir_version.schema();
     let map = Arc::new(load_map(&cli.assets, schema)?);
     let cfg = fhirpg_store::pg_config(cli.dsn.as_deref())?;
     let store = fhirpg_store::Store::connect(cfg, map.clone()).await?;
+    // CLI writes are attributable to the operator at the keyboard: a load or
+    // a delete run by hand is exactly the kind of change an audit asks about
+    // later (spec M3.15).
+    let audit = fhirpg_store::Audit::cli();
     match cli.cmd {
         Cmd::Init {
             upgrade,
@@ -289,8 +438,9 @@ async fn run_db(cli: Cli) -> Result<()> {
             if upgrade {
                 let report = store.upgrade(&sum, allow_destructive).await?;
                 eprintln!(
-                    "{schema}: upgraded — {} additive, {} destructive change(s)",
-                    report.additive, report.destructive
+                    "{schema}: upgraded — {} additive, {} destructive change(s), \
+                     {} value(s) folded",
+                    report.additive, report.destructive, report.folded
                 );
             } else {
                 let created = store.init(&sum).await?;
@@ -317,7 +467,7 @@ async fn run_db(cli: Cli) -> Result<()> {
                         eprintln!("{ctx}: validate: {e}");
                         continue;
                     }
-                    match store.put(&res).await {
+                    match store.put_audited(&res, None, &audit).await {
                         Ok(_) => ok += 1,
                         Err(e) => {
                             failed += 1;
@@ -339,7 +489,7 @@ async fn run_db(cli: Cli) -> Result<()> {
             }
         },
         Cmd::Delete { rtype, id } => {
-            if store.delete(&rtype, &id).await? {
+            if store.delete_audited(&rtype, &id, &audit).await? {
                 eprintln!("deleted");
             } else {
                 eprintln!("not found");
@@ -396,6 +546,45 @@ async fn run_db(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Cmd::VerifyAudit => {
+            let breaks = store.verify_audit().await?;
+            if breaks.is_empty() {
+                eprintln!("{schema}: audit chains verify");
+            } else {
+                for b in &breaks {
+                    eprintln!(
+                        "{schema}: {}/{} version {}: {}",
+                        b.rtype, b.id, b.version_id, b.detail
+                    );
+                }
+                bail!("{} history chain break(s) found", breaks.len());
+            }
+        }
+        Cmd::Purge {
+            rtype,
+            id,
+            reason,
+            allow_erasure,
+        } => {
+            if !allow_erasure {
+                bail!(
+                    "refusing to erase {rtype}/{id} without --allow-erasure. \
+                     This deletes the resource and its entire history, which \
+                     no other command does."
+                );
+            }
+            let audit = audit.clone().with_reason(Some(reason));
+            let report = store.purge(&rtype, &id, &audit).await?;
+            if report.existed {
+                eprintln!(
+                    "{schema}: erased {rtype}/{id} — {} version(s); a tombstone remains",
+                    report.versions_erased
+                );
+            } else {
+                eprintln!("{schema}: {rtype}/{id} not found; nothing erased");
+                std::process::exit(1);
+            }
+        }
         Cmd::Drop { yes } => {
             if !yes {
                 bail!("refusing to drop schema {schema:?} without --yes");
@@ -408,21 +597,80 @@ async fn run_db(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// Everything `serve` needs that is not the connection config.
+struct ServeOpts<'a> {
+    bind: &'a str,
+    tls_cert: Option<&'a Path>,
+    tls_key: Option<&'a Path>,
+    base_url: Option<String>,
+    trust_proxy: bool,
+    allowed_hosts: Vec<String>,
+    allow_insecure_db: bool,
+    principal_header: Option<String>,
+    reason_header: Option<String>,
+    require_principal: bool,
+    no_audit_reads: bool,
+    allow_unaudited: bool,
+    audit_mode: AuditModeArg,
+    limits: fhirpg_server::Limits,
+    pool_size: Option<usize>,
+    admin_bind: Option<String>,
+}
+
+/// Whether a bind address is loopback — the signal that this process is
+/// reachable only from its own host.
+fn binds_loopback(bind: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    match bind.to_socket_addrs() {
+        Ok(mut addrs) => addrs.all(|a| a.ip().is_loopback()),
+        // An unresolvable bind will fail later with a better message; treat
+        // it as non-loopback so the safety check is not skipped.
+        Err(_) => false,
+    }
+}
+
+/// Whether to refuse startup: exposing the API to the network while the
+/// database link is in the clear moves PHI across an untrusted segment
+/// (spec O10.7).
+///
+/// Split out from `serve` so the policy is testable on its own. The wiring
+/// that reads `PGSSLMODE` and binds the socket is not covered here; this
+/// pins the decision, which is the part that must not drift.
+fn refuse_insecure_db(bind: &str, db_encrypted: bool, allow_insecure: bool) -> bool {
+    !binds_loopback(bind) && !db_encrypted && !allow_insecure
+}
+
 /// Mount every version whose map asset exists and whose schema is
 /// installed, then serve.
-async fn serve(
-    cli: &Cli,
-    bind: &str,
-    tls_cert: Option<&Path>,
-    tls_key: Option<&Path>,
-) -> Result<()> {
+async fn serve(cli: &Cli, opts: &ServeOpts<'_>) -> Result<()> {
+    // The two halves of the trust boundary are decided together: exposing the
+    // API to the network while the database link is in the clear moves PHI
+    // across an untrusted segment (spec O10.7).
+    let ssl = fhirpg_store::SslPolicy::from_env()?;
+    if refuse_insecure_db(opts.bind, ssl.is_encrypted(), opts.allow_insecure_db) {
+        bail!(
+            "refusing to bind {} with an unencrypted database connection \
+             (PGSSLMODE={:?}). Set PGSSLMODE=require (and PGSSLROOTCERT if \
+             your server uses a private CA), or pass --allow-insecure-db to \
+             accept plaintext PHI on the database link.",
+            opts.bind,
+            ssl
+        );
+    }
+    if !ssl.is_encrypted() {
+        tracing::warn!(
+            ?ssl,
+            "database connection is not encrypted; set PGSSLMODE=require for PHI"
+        );
+    }
     let mut versions = std::collections::BTreeMap::new();
     for schema in ["r3", "r4", "r5"] {
         let Ok(map) = load_map(&cli.assets, schema) else {
             continue;
         };
         let cfg = fhirpg_store::pg_config(cli.dsn.as_deref())?;
-        let store = fhirpg_store::Store::connect(cfg, Arc::new(map)).await?;
+        let store =
+            fhirpg_store::Store::connect_full(cfg, Arc::new(map), ssl, opts.pool_size).await?;
         if store.installed().await? {
             versions.insert(schema.to_string(), Arc::new(store));
         }
@@ -431,9 +679,89 @@ async fn serve(
         bail!("no installed FHIR schemas found; run `fhirpg init` first");
     }
     let mounted: Vec<String> = versions.keys().cloned().collect();
-    let app = fhirpg_server::router(versions);
-    if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
-        return serve_tls(app, bind, cert, key, &mounted).await;
+    let scheme = if opts.tls_cert.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    let base = fhirpg_server::BaseUrl::bound(format!("{scheme}://{}", opts.bind))
+        .configured(opts.base_url.clone())
+        .trusting_proxy(opts.trust_proxy, opts.allowed_hosts.clone());
+    // `--no-audit-reads` predates `--audit-mode` and means the same as
+    // `--audit-mode off`; either spelling has to be acknowledged.
+    let mode = if opts.no_audit_reads {
+        AuditModeArg::Off
+    } else {
+        opts.audit_mode
+    };
+    if mode == AuditModeArg::Off && !opts.allow_unaudited {
+        bail!(
+            "audit mode 'off' drops the record of who read which patient. \
+             Pass --allow-unaudited to accept that (spec PR12.6)."
+        );
+    }
+    let audit = match mode {
+        AuditModeArg::Sync => fhirpg_server::AuditMode::Sync,
+        AuditModeArg::Async => fhirpg_server::AuditMode::async_default(),
+        AuditModeArg::Off => fhirpg_server::AuditMode::Off,
+    };
+    match mode {
+        AuditModeArg::Off => {
+            tracing::warn!("read auditing is OFF; disclosures will not be recorded");
+        }
+        AuditModeArg::Async => {
+            // Stated rather than buried: this is the mode's actual cost.
+            tracing::warn!(
+                "audit mode is async: disclosure records are written in batches, \
+                 so records still queued if the process is killed are lost"
+            );
+        }
+        AuditModeArg::Sync => {}
+    }
+    if opts.principal_header.is_some() && !opts.trust_proxy {
+        bail!(
+            "--principal-header without --trust-proxy would let any client assert \
+             any identity, so the header is ignored. Set --trust-proxy if a proxy \
+             you control is the only way in (spec PR12.2)."
+        );
+    }
+    if opts.principal_header.is_none() {
+        tracing::warn!(
+            "no --principal-header: every write will be recorded as \
+             'unauthenticated' (spec PR12.3)"
+        );
+    }
+    let principal = fhirpg_server::PrincipalPolicy::new(
+        opts.principal_header.clone(),
+        opts.reason_header.clone(),
+        opts.trust_proxy,
+        opts.require_principal,
+    );
+    let (app, state) =
+        fhirpg_server::router_and_state(versions, base, principal, audit, opts.limits);
+    // Kept for the shutdown drain; `admin_router` takes ownership of a clone.
+    let audit_state = state.clone();
+    if let Some(addr) = &opts.admin_bind {
+        let admin = fhirpg_server::admin_router(state);
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("admin bind {addr}"))?;
+        eprintln!("fhirpg admin plane on http://{addr}");
+        // Its own task: the admin plane must answer while the API is shedding
+        // load, since that is exactly when someone is looking at it.
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, admin).await {
+                tracing::error!(error = %e, "admin plane stopped");
+            }
+        });
+    }
+    let bind = opts.bind;
+    if let (Some(cert), Some(key)) = (opts.tls_cert, opts.tls_key) {
+        let r = serve_tls(app, bind, cert, key, &mounted).await;
+        // After the listener stops, not before: records queued by requests
+        // still in flight during graceful shutdown must be written too.
+        audit_state.shutdown_audit().await;
+        return r;
     }
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -442,6 +770,7 @@ async fn serve(
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    audit_state.shutdown_audit().await;
     eprintln!("fhirpg: shut down cleanly");
     Ok(())
 }
@@ -488,13 +817,21 @@ async fn serve_tls(
 /// the fhir crate's published r3/r4 features do not currently compile.
 #[cfg(feature = "validate")]
 fn validate_typed(ver: Ver, res: &Value) -> Result<()> {
+    // Every version, since fhir 1.2.1: the typed model rejects anything the
+    // release does not define, which is a stricter check than shredding
+    // alone (spec V9.2).
     match ver {
+        Ver::R3 => {
+            serde_json::from_value::<fhir::r3::resources::Resource>(res.clone())?;
+        }
+        Ver::R4 => {
+            serde_json::from_value::<fhir::r4::resources::Resource>(res.clone())?;
+        }
         Ver::R5 => {
             serde_json::from_value::<fhir::r5::resources::Resource>(res.clone())?;
-            Ok(())
         }
-        _ => bail!("--validate currently supports r5 only"),
     }
+    Ok(())
 }
 
 #[cfg(not(feature = "validate"))]
@@ -572,4 +909,104 @@ fn read_resources(path: &Path) -> Result<Vec<(String, Value)>> {
         bail!("{name}: no resources found");
     }
     Ok(out)
+}
+
+#[cfg(all(test, feature = "validate"))]
+mod validate_tests {
+    //! `--validate` covers every version (spec V9.2).
+    //!
+    //! It was R5-only until `fhir` 1.2.1: the published crate's r3/r4 features
+    //! did not compile, because the `Validate` derive expanded to `crate::r5::`
+    //! paths. These tests exist so that regression is caught here rather than
+    //! by a user discovering `--validate` silently does less for their version.
+
+    use super::{Ver, validate_typed};
+    use serde_json::json;
+
+    #[test]
+    fn every_version_validates_a_good_resource() {
+        for ver in [Ver::R3, Ver::R4, Ver::R5] {
+            let patient = json!({
+                "resourceType": "Patient",
+                "id": "ok",
+                "active": true,
+                "name": [{"family": "Chalmers", "given": ["Peter"]}]
+            });
+            validate_typed(ver, &patient)
+                .unwrap_or_else(|e| panic!("{ver:?} rejected a valid Patient: {e}"));
+        }
+    }
+
+    #[test]
+    fn every_version_rejects_a_wrongly_typed_element() {
+        // `active` is a boolean in every release; a string is not coercible,
+        // so the typed model must refuse it.
+        for ver in [Ver::R3, Ver::R4, Ver::R5] {
+            let bad = json!({"resourceType": "Patient", "id": "bad", "active": "yes"});
+            assert!(
+                validate_typed(ver, &bad).is_err(),
+                "{ver:?} accepted a string where the model declares a boolean"
+            );
+        }
+    }
+
+    #[test]
+    fn every_version_rejects_an_unknown_resource_type() {
+        for ver in [Ver::R3, Ver::R4, Ver::R5] {
+            let bad = json!({"resourceType": "NotAResource", "id": "bad"});
+            assert!(
+                validate_typed(ver, &bad).is_err(),
+                "{ver:?} accepted a resourceType the release does not define"
+            );
+        }
+    }
+
+    /// What `--validate` does *not* do, asserted so the boundary is explicit.
+    ///
+    /// serde ignores unknown fields by default, so the typed model tolerates an
+    /// element the release never defined. fhirpg's own shredder rejects those
+    /// (plan D12), which is the check that actually catches them — `--validate`
+    /// adds type and cardinality rigour on top, not unknown-element rejection.
+    #[test]
+    fn the_typed_model_does_not_catch_unknown_elements() {
+        let bad = json!({"resourceType": "Patient", "id": "x", "notAnElement": "v"});
+        assert!(
+            validate_typed(Ver::R4, &bad).is_ok(),
+            "if this now fails, the model gained deny_unknown_fields — good \
+             news, and this test should become an assertion that it errors"
+        );
+    }
+}
+
+#[cfg(test)]
+mod startup_guard_tests {
+    use super::refuse_insecure_db;
+
+    /// The startup refusal is a policy, and policies drift silently. Each row
+    /// is a deployment someone will actually attempt.
+    #[test]
+    fn refuses_only_plaintext_phi_on_the_network() {
+        // Public bind + plaintext database = PHI over an untrusted segment.
+        assert!(refuse_insecure_db("0.0.0.0:8080", false, false));
+        assert!(refuse_insecure_db("192.168.1.10:8080", false, false));
+        // Encrypted database link: fine at any bind.
+        assert!(!refuse_insecure_db("0.0.0.0:8080", true, false));
+        // Loopback only: the database link never leaves the host.
+        assert!(!refuse_insecure_db("127.0.0.1:8080", false, false));
+        assert!(!refuse_insecure_db("[::1]:8080", false, false));
+        // Explicitly accepted by the operator.
+        assert!(!refuse_insecure_db("0.0.0.0:8080", false, true));
+    }
+
+    /// An unresolvable bind must not skip the check. Treating "I could not
+    /// tell" as "not loopback" fails safe; the bind itself errors later with
+    /// a better message.
+    #[test]
+    fn unresolvable_bind_is_not_treated_as_loopback() {
+        assert!(refuse_insecure_db(
+            "no-such-host.invalid:8080",
+            false,
+            false
+        ));
+    }
 }

@@ -81,6 +81,7 @@ impl<'s> ResourceBuilder<'s> {
         let rname = self.root_def.name.clone();
         let base_name = self.table_reg.claim(&snake(&rname));
         self.tables.push(Table {
+            norm_cols: Vec::new(),
             name: base_name.clone(),
             kind: TableKind::Base,
             path: rname.clone(),
@@ -104,6 +105,7 @@ impl<'s> ResourceBuilder<'s> {
         ] {
             let name = self.table_reg.claim(&format!("{base_name}{suffix}"));
             self.tables.push(Table {
+                norm_cols: Vec::new(),
                 name,
                 kind,
                 path: String::new(),
@@ -139,6 +141,7 @@ impl<'s> ResourceBuilder<'s> {
         let parent = &self.tables[parent_table as usize].name;
         let name = self.table_reg.claim(&format!("{parent}_{col_base}"));
         self.tables.push(Table {
+            norm_cols: Vec::new(),
             name,
             kind: TableKind::Elem,
             path: res_path.to_string(),

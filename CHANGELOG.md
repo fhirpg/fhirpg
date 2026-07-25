@@ -1,5 +1,222 @@
 # Changelog
 
+## Unreleased — M7, trustworthy under load and under audit (2026-07)
+
+Correctness and security work from the hardening review. Specification:
+[`spec/index.md`](spec/index.md) §§ 3–13; work breakdown:
+[`tasks.md`](tasks.md) M7.
+
+**Fixed — reads could return a resource that never existed.** A read spans
+one base table and every child table; those were separate implicit
+transactions, so a write landing mid-read reconstructed a mix of two
+versions. Every multi-statement read (`get`, `get_all`, `status`,
+`search_page`) now runs in one `REPEATABLE READ READ ONLY` transaction
+(R4.5), and a search materializes its whole page in a single snapshot. The
+new `concurrency` suite reproduces the old behaviour when isolation is
+lowered, so the fix is pinned by a test that fails without it.
+
+**Fixed — conditional create could create twice.** `If-None-Exist` searched
+and then wrote in two steps, so two concurrent requests with identical
+criteria both found nothing and both created — a patient entered twice.
+Match and write now share one transaction guarded by a
+`pg_advisory_xact_lock` on a hash of the criteria (A7.10). Conditional
+delete likewise.
+
+**Fixed — PHI crossed to PostgreSQL in the clear.** The connector was
+hard-coded `NoTls`, so `sslmode=require` could not be honored. Connections
+now go through rustls, honoring `sslmode` and `PGSSLROOTCERT` (O10.7), and
+`serve` refuses a non-loopback bind over an unencrypted database link
+without `--allow-insecure-db`. fhirpg's `require` validates the server
+certificate where libpq's does not — a deliberate deviation, in the safe
+direction.
+
+**Fixed — response URLs came from the `Host` header.** `Bundle.entry.fullUrl`
+and paging links were built from an attacker-controlled header, always as
+`http://`. They now come from `--base-url`, or from the address actually
+bound; forwarded headers are honored only under `--trust-proxy` with an
+optional `--allowed-host` list (A7.7).
+
+**Fixed — Bundle entries silently ignored their preconditions.**
+`ifMatch` is now honored inside batch and transaction entries (412 on
+mismatch, no longer flattened to 400); `ifNoneExist`, `ifModifiedSince`, and
+`ifNoneMatch` fail the entry with 501 rather than being accepted and
+discarded (A7.9).
+
+**Fixed — `urn:uuid` rewriting corrupted non-reference data.** Transaction
+processing replaced *any* string equal to a bundle `fullUrl`, including
+narrative, `valueString`, and identifiers. Only `Reference.reference` values
+are rewritten now.
+
+**Fixed — internal error text reached clients.** `StoreError` now separates
+`Unsupported` (client-safe: names the caller's own parameter or modifier)
+from `Other` (internal: logged behind an incident id, never returned)
+(A7.11). The honest "this search parameter is not supported" messages are
+unchanged.
+
+**Fixed — string search missed accented names, and scanned the table
+looking for them.** FHIR requires `string` search to ignore case *and*
+accents; fhirpg shipped `ILIKE`, which ignores only case, so `family=muller`
+did not find `Müller` and neither spelling of a decomposed `é` found the
+other. Each string search target now has a folded companion column computed
+in Rust at write time, so one implementation defines string equality rather
+than one in Rust and one in SQL that must agree for every codepoint (P6.6).
+No PostgreSQL extension is required.
+
+The prefix predicate is emitted as a range (`col >= $1 AND col < $2`, upper
+bound computed in Rust) rather than `LIKE $1 || '%'`. PostgreSQL extracts a
+prefix from a *constant* pattern only, so the `LIKE` form uses the index in
+a custom plan and silently falls back to a sequential scan in the generic
+plan — fast in every hand-run `EXPLAIN` with a literal, and fast for the
+first few executions in production, then not. A test pins this with
+`plan_cache_mode = force_generic_plan`, the only setting under which the old
+form visibly fails. `:exact` still compares the literal stored string.
+
+`init --upgrade` adds the columns **and backfills them** before returning,
+reporting how many values it folded; without that, an upgraded install would
+have answered string searches from NULL columns and returned fewer results
+with no error.
+
+**Added — edge limits are configurable.** The request timeout, concurrency
+cap, body size, `_count` ceiling, `_include` expansion cap, and pool size
+were constants compiled into the binary; each is now a `serve` flag. The
+right value depends on the deployment, and the previous answer to "this is
+too low" was "rebuild it". `--pool-size` beats `FHIRPG_POOL_SIZE`, so a
+typed flag is never silently overridden by an inherited environment.
+
+**Fixed — a read whose audit record failed was served anyway.** Recording a
+disclosure was best-effort: a failed insert was logged loudly and the
+response returned regardless. That inverts the guarantee — a disclosure with
+no record is indistinguishable, afterwards, from a disclosure that never
+happened. All four read paths (read, vread, history, search) now propagate a
+refusal as 503, so in every audit mode a read that cannot be recorded is not
+served (PR12.6).
+
+**Added — `--audit-mode sync|async|off`.** `sync` (the default) commits the
+record before responding. `async` queues in memory and writes in batches
+through one `INSERT ... SELECT unnest(...)`, trading a round trip per read
+for a bounded loss window, which it announces at startup and drains on
+graceful shutdown. `off` still requires `--allow-unaudited`. A saturated
+queue refuses the read rather than dropping the record.
+
+The spec draft had `async` as the default; it ships as `sync`, because a
+fast default would make every deployment silently accept a loss window it
+never chose.
+
+Four counters per version on `/metrics` distinguish the two failures that
+look alike from a distance: `refused` counts reads turned away to keep the
+log honest — the system working as designed — while `lost` counts records
+the writer could not commit after the data was served, which is an incident.
+Queue depth is derived from the counters rather than tracked separately, so
+it cannot report a value they contradict.
+
+**Added — latency as a histogram.** `/metrics` served a cumulative
+`fhirpg_request_latency_micros_total`, which with a request count gives only
+the mean — and a mean cannot distinguish "every request took 40ms" from "99%
+took 5ms and 1% took 4 seconds", which is the case an operator is paged for.
+`fhirpg_request_latency_seconds` is now a Prometheus histogram over the
+default 1ms–10s buckets, so `histogram_quantile` answers p99. The old
+counter remains as the histogram's `_sum`.
+
+**Added — CI/CD on both forges.** GitHub Actions and Codeberg Woodpecker run
+the same gates: fmt, clippy, unit tests, the book, the live-PostgreSQL
+suite, and the supply-chain checks. Tagging `v*` builds binaries, generates
+a CycloneDX SBOM, and attaches both with SHA-256 checksums to a release —
+the bill of materials now ships with the artifact rather than only with the
+CI run that produced it. Publishing to crates.io stays manual and
+confirmation-gated, because a published version is immutable. See
+[`doc/ci.md`](doc/ci.md).
+
+**Added — the declared MSRV is now verified.** `rust-version = "1.90"` was a
+claim no job checked; both forges now build on exactly that toolchain, read
+from the manifest rather than hard-coded.
+
+**Added**
+
+- Resource ids are validated against the FHIR `id` production on every path
+  that accepts one (R4.6).
+- Every response carries `Cache-Control: no-store`, `Pragma: no-cache`,
+  `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer`
+  (A7.8); a client-supplied `X-Request-Id` is length- and
+  character-validated before being echoed or logged.
+- `_include`/`_revinclude` expansion is capped at 1,000 resources and adds
+  an `OperationOutcome` warning to the bundle when the cap truncates, rather
+  than silently returning less clinical context than asked for (P6.7).
+- Pool size is configurable via `FHIRPG_POOL_SIZE` instead of compiled in.
+- `crates/fhirpg-store/tests/concurrency.rs`: torn reads, racing conditional
+  creates, and racing `If-Match` updates (T11.6).
+
+**Added — the audit trail (M3.15–M3.17, §12)**
+
+fhirpg still does not authenticate; the perimeter does. But "authentication
+is elsewhere" cannot mean "the record of who did what is nowhere": the
+perimeter knows the identity, and only the store knows which rows were
+touched.
+
+- Every history row carries an **audit envelope** — `actor`, `actor_source`,
+  `client`, `request_id`, `reason` — written by the same statement, in the
+  same transaction, as the change it describes. An audit record that can be
+  lost independently of its change is not an audit record.
+- Every **read** appends a disclosure record to `fhirpg_access_log`: read,
+  vread, history, and search, the last carrying how many resources it
+  returned. "Who looked at this patient" was previously unanswerable.
+- History is **tamper-evident**: a per-resource SHA-256 chain
+  (`prev_hash`/`row_hash`) computed in SQL, so it covers the database's own
+  `now()` and cannot race the read of the previous hash. `fhirpg
+  verify-audit` recomputes every chain and exits nonzero on a break.
+- History is **append-only in the database**: a `BEFORE UPDATE OR DELETE`
+  trigger on every history table refuses the operation. Rewriting history
+  now requires deliberately disabling a trigger.
+- The server accepts a principal from a configured header, honored **only**
+  behind `--trust-proxy` — without it the header is ignored, not trusted,
+  because otherwise any client could name itself anyone.
+  `--require-principal` makes an unattributable request a 401. CLI writes
+  are attributed to the operator at the keyboard.
+
+**Fixed — `--validate` now covers R3 and R4, not just R5**
+
+The restriction was never fhirpg's: the published `fhir` 1.2.0 could not
+compile its own `r3`/`r4` features, because the `Validate` derive expanded to
+`crate::r5::` paths that are feature-gated away. An R4-only build failed with
+4,422 errors. The repository never showed it — Cargo resolves the derive macro
+through its `path` dependency, where the fix already existed — so only
+crates.io consumers were affected.
+
+Fixed upstream by publishing `fhir-derive-macros` 1.0.1 and `fhir` 1.2.1;
+fhirpg's floor moves to `fhir = "1.2.1"` with `features = ["r3", "r4"]`, and
+`validate_typed` gains the two missing arms.
+
+`validate_tests` in the CLI pins the behaviour for all three versions,
+including one assertion about what `--validate` does *not* do: serde ignores
+unknown fields, so the typed model tolerates an element the release never
+defined. The shredder is what rejects those (plan D12); `--validate` adds type
+and cardinality rigour on top.
+
+**Added — resource limits, capability honesty, supply chain**
+
+- A per-request timeout and an edge concurrency limit, shedding as 503 +
+  `Retry-After` or 504, both as OperationOutcomes (O10.8).
+- The CapabilityStatement now declares `versioning`, `readHistory`,
+  `updateCreate`, `conditionalCreate`/`Update`/`Delete`, `referencePolicy`,
+  `searchInclude`/`RevInclude`, system-level `transaction`/`batch`, and a
+  `security` block stating plainly that fhirpg verifies no identity (A7.12).
+- CI gains a supply-chain job (cargo-deny, CycloneDX SBOM) and `deny.toml`
+  (O10.10).
+- `book/src/trust-boundary.md`: what fhirpg guarantees, what the deployment
+  must provide, and what neither provides yet — with a worked `serve`
+  invocation and the `REVOKE` grants that complement the trigger.
+
+**Fixed — `postgres: db error`.** `tokio_postgres::Error`'s `Display` is the
+bare string `"db error"`; every SQLSTATE, message, and hint hangs off
+`source()`. Operator logs were therefore recording nothing useful about any
+database failure. `StoreError::Pg` now renders the full detail — to logs
+only, never to a response body.
+
+**Specification** gained the audit envelope and tamper-evident history
+(M3.15–M3.18), snapshot reads (R4.5), id validation (R4.6),
+accent-insensitive search (P6.6), bounded search cost (P6.7), A7.7–A7.12,
+O10.7–O10.10, § 12 *Trust, principal, and audit*, and § 13 *Compliance
+mapping* (HIPAA, GDPR, ONC/HTI, IEC 62304).
+
 ## Unreleased — 2.0.0-dev (ground-up rewrite, 2026-07)
 
 A complete rewrite: FHIR resources now live in **fully normalized

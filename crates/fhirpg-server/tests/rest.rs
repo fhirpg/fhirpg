@@ -259,6 +259,43 @@ async fn rest_api() {
     )
     .unwrap();
     assert!(text.contains("fhirpg_requests_total"), "{text}");
+    // Latency must be a histogram, not just a running total: a mean cannot
+    // answer p99, which is the number an operator is actually paged about.
+    assert!(
+        text.contains("# TYPE fhirpg_request_latency_seconds histogram"),
+        "{text}"
+    );
+    assert!(
+        text.contains(r#"fhirpg_request_latency_seconds_bucket{le="+Inf"}"#),
+        "{text}"
+    );
+    assert!(
+        text.contains("fhirpg_request_latency_seconds_count"),
+        "{text}"
+    );
+    // Buckets are cumulative and must not decrease; +Inf equals the count.
+    let mut last = 0u64;
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("fhirpg_request_latency_seconds_bucket") else {
+            continue;
+        };
+        let n: u64 = rest
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .expect("bucket count");
+        assert!(n >= last, "buckets not cumulative: {line}");
+        last = n;
+    }
+    let count: u64 = text
+        .lines()
+        .find_map(|l| l.strip_prefix("fhirpg_request_latency_seconds_count "))
+        .expect("count line")
+        .parse()
+        .expect("count");
+    assert_eq!(count, last, "+Inf bucket must equal the observation count");
+    assert!(count > 0, "requests should have been observed");
 
     // Conditional create (If-None-Exist)
     let cc = json!({"resourceType": "Patient",

@@ -86,6 +86,7 @@ pub fn shred(rm: &ResourceMap, v: &Value) -> Result<ShredOut, ShredError> {
         id: None,
     };
     sh.walk_obj(rm.root, obj, 0, &[], "", true)?;
+    fill_norm_cols(rm, &mut sh.rows);
     Ok(ShredOut {
         id: sh.id,
         rows: sh.rows,
@@ -93,6 +94,26 @@ pub fn shred(rm: &ResourceMap, v: &Value) -> Result<ShredOut, ShredError> {
         deep: sh.deep,
         contained: sh.contained,
     })
+}
+
+/// Fill each table's folded search columns (P6.6) from the values just
+/// written. A row that never set the source column gets no folded value, so
+/// the folded column stays NULL alongside it rather than becoming an empty
+/// string that would match a prefix search for "".
+fn fill_norm_cols(rm: &ResourceMap, rows: &mut [Row]) {
+    for row in rows {
+        let pairs = &rm.tables[row.table as usize].norm_cols;
+        if pairs.is_empty() {
+            continue;
+        }
+        let mut add: Vec<(String, SqlVal)> = Vec::new();
+        for (src, dst) in pairs {
+            if let Some((_, SqlVal::Text(v))) = row.cols.iter().find(|(c, _)| c == src) {
+                add.push((dst.clone(), SqlVal::Text(crate::fold::fold(v))));
+            }
+        }
+        row.cols.extend(add);
+    }
 }
 
 struct Sh<'a> {

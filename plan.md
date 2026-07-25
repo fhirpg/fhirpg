@@ -64,12 +64,44 @@ Work breakdown: [`tasks.md`](tasks.md).
 - **D13 — Auth is perimeter, not core.** The server implements no
   authentication; deployments front it with their identity layer. This keeps
   the trust boundary explicit and auditable. Documented prominently (O10.5).
+  **Amended by D15:** the perimeter authenticates, but fhirpg must still
+  *record* who acted.
 - **D14 — Workspace layout.** One cargo workspace:
   `fhirpg-map` (relational map types + generic shred/reconstruct engine),
   `fhirpg-gen` (spec → DDL + map), `fhirpg-store` (PostgreSQL layer:
   init/load/search/history), `fhirpg-server` (axum), `fhirpg` (CLI binary
   tying it together). Generated artifacts live in `assets/` and are embedded
   in the binary.
+- **D15 — Attribution is core, even though authentication is not.** D13
+  keeps identity *verification* outside; it does not excuse anonymous
+  history. fhirpg accepts a principal from a trusted proxy (PR12.1–PR12.3)
+  and records it on every write and every read. Rationale: HIPAA
+  §164.312(b) asks who accessed a record, and no perimeter can answer that
+  for us — the perimeter knows the identity, only the store knows which rows
+  were touched. Consequence: a schema change (M3.15) and an access log
+  (PR12.5), both additive.
+- **D16 — Audit before latency.** Access logging defaults to `async` with a
+  bounded queue that **fails closed** (PR12.6). Dropping a disclosure record
+  to keep latency down is the wrong trade for this system; a deployment that
+  disagrees says so explicitly with `--allow-unaudited`.
+- **D17 — Tamper-evidence by hash chain, per resource id.** A global chain
+  would serialize every write; per-id chains keep concurrency and still make
+  a silent edit or deletion detectable (M3.16). Chosen over write-once
+  storage or an external ledger, both of which push the problem into the
+  deployment.
+- **D18 — Snapshot reads.** Multi-table reads run in one
+  `REPEATABLE READ READ ONLY` transaction (R4.5). The cost is one extra
+  round trip per read; the alternative is reconstructing resources that
+  never existed, which is not a trade a clinical store gets to make.
+- **D19 — Normalize for search, keep the original for truth.** Accent- and
+  case-insensitive matching (P6.6) uses generated normalized columns, not
+  mangled stored values. The stored column stays lexically exact for
+  round-trip (R4.2); the normalized column exists purely to be indexed and
+  matched against.
+- **D20 — Encrypt the database link by default.** rustls, `sslmode`
+  honored, and a startup refusal when a non-loopback bind meets an
+  unencrypted database connection (O10.7). PHI in flight between the server
+  and PostgreSQL is exactly as sensitive as PHI in flight to the client.
 
 ## Risks
 
@@ -93,6 +125,27 @@ Work breakdown: [`tasks.md`](tasks.md).
   the most intricate part of round-trip. Mitigation: it is exercised by
   every spec example containing extensions plus targeted proptests; built in
   milestone 1, not bolted on.
+- **R6 — Audit write amplification.** Every read gains an insert (PR12.5)
+  and every write gains a hash computation and wider history row (M3.15,
+  M3.16). Mitigation: batched async inserts on a dedicated connection, a
+  measured before/after in `doc/benchmarks.md`, and `sync` mode reserved for
+  deployments that ask for it. Accept a real cost here; the alternative is
+  not shipping into a hospital.
+- **R7 — `unaccent` is an extension, not core PostgreSQL.** P6.6 depends on
+  it, and managed providers vary in whether an unprivileged role may create
+  it. Mitigation: `init` probes for it and fails with a clear instruction
+  rather than degrading silently; a fallback pure-SQL folding function
+  covers Latin-1/Latin Extended-A when the extension is unavailable.
+- **R8 — Schema migration for the audit columns.** M3.15/M3.16 change every
+  history table across three versions. Mitigation: the changes are purely
+  additive, so `init --upgrade` (T26) already covers them; existing rows get
+  `actor = 'unknown (pre-audit)'` and a null hash chain, and `verify-audit`
+  reports chains as starting at the first hashed version rather than
+  claiming a break.
+- **R9 — Snapshot reads under long transactions.** REPEATABLE READ readers
+  hold a snapshot; a slow reconstruction of a very large resource delays
+  vacuum. Mitigation: reads are already bounded by `statement_timeout`, the
+  transaction is READ ONLY, and bloat is watched by the existing metrics.
 
 ## Milestones
 
@@ -113,6 +166,13 @@ Work breakdown: [`tasks.md`](tasks.md).
 - **M6 — Production hardening.** Metrics, health, logging redaction,
   migrations/upgrade path, TLS feature, benchmarks + regression gate, book,
   security review, crates.io release.
+- **M7 — Trustworthy under load and under audit.** The gap between "works"
+  and "may hold patient data". Correctness under concurrency (snapshot
+  reads, atomic conditionals, honored preconditions), the audit envelope and
+  access log, tamper-evident history, encrypted database transport,
+  configured service base URL, PHI response headers, edge resource limits,
+  worldwide string search, and supply-chain evidence. Exit criterion: the
+  §13 compliance table has a passing test in every Evidence cell.
 
 ## Non-goals (this rewrite)
 

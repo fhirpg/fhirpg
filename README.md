@@ -133,6 +133,8 @@ spec defines what fhirpg guarantees and what the deployment must provide.
 - [`plan.md`](plan.md) — design decisions, risks, milestones.
 - [`tasks.md`](tasks.md) — the implementation work breakdown.
 - [`doc/benchmarks.md`](doc/benchmarks.md) — measured performance.
+- [`doc/ci.md`](doc/ci.md) — the gates on GitHub and Codeberg, and how
+  releases are cut.
 - [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License

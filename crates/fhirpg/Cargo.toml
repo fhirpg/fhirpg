@@ -26,9 +26,10 @@ flate2.workspace = true
 sha2.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-# The published crate's r3/r4 features do not compile (missing macro
-# import); validation is R5-only until fhir > 1.2.0 fixes that.
-fhir = { version = "1.2", optional = true }
+# Typed validation for every version. 1.2.1 is the floor: 1.2.0's r3/r4
+# features did not compile for published-crate users, because the `Validate`
+# derive expanded to `crate::r5::` paths (fixed in fhir-derive-macros 1.0.1).
+fhir = { version = "1.2.1", optional = true, features = ["r3", "r4"] }
 axum = "0.8"
 axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
 

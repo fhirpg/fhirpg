@@ -5,6 +5,7 @@
 //! value is bound as a parameter — nothing user-supplied is interpolated
 //! into SQL text.
 
+use fhirpg_map::fold::{fold, prefix_upper};
 use fhirpg_map::model::{RelMap, ResourceMap, SearchDef, TargetKind};
 
 use crate::StoreError;
@@ -37,19 +38,19 @@ fn sort_col(rm: &ResourceMap, key: &SortKey) -> Result<String, StoreError> {
         return Ok("p.\"last_updated\"".to_string());
     }
     let Some(def) = rm.search.iter().find(|d| d.code == key.code) else {
-        return Err(StoreError::Other(format!(
+        return Err(StoreError::Unsupported(format!(
             "unsupported sort parameter {:?}",
             key.code
         )));
     };
     let Some(t) = def.targets.iter().find(|t| t.table == 0) else {
-        return Err(StoreError::Other(format!(
+        return Err(StoreError::Unsupported(format!(
             "cannot sort by {:?}: not a base-table parameter",
             key.code
         )));
     };
     let col = match &t.kind {
-        TargetKind::Str { col }
+        TargetKind::Str { col, .. }
         | TargetKind::Number { col }
         | TargetKind::Uri { col }
         | TargetKind::Token { code: col, .. }
@@ -159,7 +160,7 @@ fn param_predicate(
     // the rest of the chain to the referenced type.
     if let Some((head, rest)) = rawname.split_once('.') {
         if depth >= 1 {
-            return Err(StoreError::Other(
+            return Err(StoreError::Unsupported(
                 "reference chains deeper than one hop are not supported".into(),
             ));
         }
@@ -168,17 +169,17 @@ fn param_predicate(
             None => (head, None),
         };
         let Some(target_type) = target_type else {
-            return Err(StoreError::Other(format!(
+            return Err(StoreError::Unsupported(format!(
                 "chained parameter {head:?} needs an explicit type: {refname}:Type.{rest}"
             )));
         };
         let Some(def) = rm.search.iter().find(|d| d.code == refname) else {
-            return Err(StoreError::Other(format!(
+            return Err(StoreError::Unsupported(format!(
                 "unsupported search parameter {refname:?}"
             )));
         };
         let Some(target_rm) = map.resources.get(target_type) else {
-            return Err(StoreError::Other(format!(
+            return Err(StoreError::Unsupported(format!(
                 "unknown chain target type {target_type:?}"
             )));
         };
@@ -213,7 +214,7 @@ fn param_predicate(
             }
         }
         if ors.is_empty() {
-            return Err(StoreError::Other(format!(
+            return Err(StoreError::Unsupported(format!(
                 "{refname:?} is not a reference parameter"
             )));
         }
@@ -225,12 +226,12 @@ fn param_predicate(
         None => (rawname, None),
     };
     let Some(def) = rm.search.iter().find(|d| d.code == name) else {
-        return Err(StoreError::Other(format!(
+        return Err(StoreError::Unsupported(format!(
             "unsupported search parameter {name:?}"
         )));
     };
     if def.targets.is_empty() {
-        return Err(StoreError::Other(format!(
+        return Err(StoreError::Unsupported(format!(
             "search parameter {name:?} is not supported: {}",
             def.note.as_deref().unwrap_or("no targets")
         )));
@@ -268,19 +269,55 @@ fn target_pred(
         format!("${}", binds.len())
     };
     match &t.kind {
-        TargetKind::Str { col } => {
+        TargetKind::Str { col, norm } => {
             let c = format!("«c».\"{col}\"");
+            // `:exact` is defined as the literal string, so it compares the
+            // stored value. Everything else is case- and accent-insensitive
+            // and compares the folded companion column, folding the search
+            // term with the same function that produced it (P6.6). Maps
+            // generated before folding existed have no companion column; fall
+            // back to ILIKE, which is case-insensitive only.
+            let Some(n) = norm else {
+                return match modifier {
+                    Some("exact") => Ok(format!("{c} = {}", b(binds, value))),
+                    Some("contains") => Ok(format!(
+                        "{c} ILIKE {}",
+                        b(binds, &format!("%{}%", like_escape(value)))
+                    )),
+                    None | Some("text") => Ok(format!(
+                        "{c} ILIKE {}",
+                        b(binds, &format!("{}%", like_escape(value)))
+                    )),
+                    Some(m) => Err(StoreError::Unsupported(format!(
+                        "unsupported modifier :{m}"
+                    ))),
+                };
+            };
+            let nc = format!("«c».\"{n}\"");
+            let folded = fold(value);
             match modifier {
                 Some("exact") => Ok(format!("{c} = {}", b(binds, value))),
                 Some("contains") => Ok(format!(
-                    "{c} ILIKE {}",
-                    b(binds, &format!("%{}%", like_escape(value)))
+                    "{nc} LIKE {} ESCAPE '\\'",
+                    b(binds, &format!("%{}%", like_escape(&folded)))
                 )),
-                None | Some("text") => Ok(format!(
-                    "{c} ILIKE {}",
-                    b(binds, &format!("{}%", like_escape(value)))
-                )),
-                Some(m) => Err(StoreError::Other(format!("unsupported modifier :{m}"))),
+                None | Some("text") => {
+                    // A range scan rather than `LIKE $1 || '%'`: the planner
+                    // only extracts a prefix from a *constant* pattern, so a
+                    // bound parameter under a generic plan would degrade to a
+                    // sequential scan. `>=`/`<` on a COLLATE "C" column always
+                    // uses the btree index.
+                    let lo = b(binds, &folded);
+                    match prefix_upper(&folded) {
+                        Some(hi) => Ok(format!("({nc} >= {lo} AND {nc} < {})", b(binds, &hi))),
+                        // Empty term, or a term at the top of the codepoint
+                        // range: only the lower bound constrains anything.
+                        None => Ok(format!("{nc} >= {lo}")),
+                    }
+                }
+                Some(m) => Err(StoreError::Unsupported(format!(
+                    "unsupported modifier :{m}"
+                ))),
             }
         }
         TargetKind::Token { system, code } => {
@@ -388,7 +425,7 @@ fn date_pred(
 ) -> Result<String, StoreError> {
     let (prefix, v) = date_prefix(value);
     let Some((lo, hi)) = date_bounds(v) else {
-        return Err(StoreError::Other(format!("invalid date value {v:?}")));
+        return Err(StoreError::Unsupported(format!("invalid date value {v:?}")));
     };
     // Bind lazily: a parameter PostgreSQL never sees referenced is an error,
     // so each comparison binds only the bound(s) it actually uses.
@@ -454,7 +491,7 @@ fn date_pred(
             format!("{lo_col} < {hi_b}")
         }
         other => {
-            return Err(StoreError::Other(format!(
+            return Err(StoreError::Unsupported(format!(
                 "unsupported date prefix {other:?}"
             )));
         }

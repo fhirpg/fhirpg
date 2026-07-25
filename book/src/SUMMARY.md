@@ -8,4 +8,5 @@
 - [The REST API](rest-api.md)
 - [FHIR versions](fhir-versions.md)
 - [Operations](operations.md)
+- [The trust boundary](trust-boundary.md)
 - [Architecture](architecture.md)

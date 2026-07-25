@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "fhirpg"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "fhirpg-gen"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fhirpg-map",
  "serde",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "fhirpg-map"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "flate2",
  "serde",
@@ -696,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "fhirpg-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "fhirpg-gen",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "fhirpg-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "deadpool-postgres",
  "fhirpg-gen",

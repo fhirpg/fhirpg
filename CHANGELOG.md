@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — M7, trustworthy under load and under audit (2026-07)
+## 0.3.0 — M7, trustworthy under load and under audit (2026-07-25)
 
 Correctness and security work from the hardening review. Specification:
 [`spec/index.md`](spec/index.md) §§ 3–13; work breakdown:

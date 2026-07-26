@@ -23,5 +23,5 @@ tower = { version = "0.5", features = ["limit", "load-shed", "timeout", "util"] 
 [dev-dependencies]
 fhirpg-gen.workspace = true
 http-body-util = "0.1"
-fhirpg-store = { path = "../fhirpg-store" }
+fhirpg-store.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

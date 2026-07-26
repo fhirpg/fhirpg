@@ -82,7 +82,11 @@ jobs:
           FHIRPG_PROPTEST_CASES: "10000"
         run: |
           cargo test --release -p fhirpg-gen --test proptest_roundtrip -- --nocapture
-          cargo test --release -p fhirpg-store -p fhirpg-server -- --nocapture
+          # One test thread: several of these install a full FHIR schema
+          # (5,700-7,300 tables) and two doing so concurrently can exhaust the
+          # server's lock budget, which surfaces as an unrelated-looking
+          # "out of shared memory" rather than as a resource limit.
+          cargo test --release -p fhirpg-store -p fhirpg-server -- --nocapture --test-threads=1
 
   tls-database:
     name: TLS-only PostgreSQL

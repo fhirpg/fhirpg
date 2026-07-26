@@ -721,7 +721,6 @@ dependencies = [
  "futures-util",
  "rustls",
  "rustls-native-certs",
- "rustls-pemfile",
  "serde_json",
  "sha2 0.10.9",
  "thiserror",

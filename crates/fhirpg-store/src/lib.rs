@@ -517,11 +517,15 @@ fn pool_size(explicit: Option<usize>) -> usize {
 fn root_store() -> Result<rustls::RootCertStore, StoreError> {
     let mut roots = rustls::RootCertStore::empty();
     if let Ok(path) = std::env::var("PGSSLROOTCERT") {
-        let pem = std::fs::read(&path)
-            .map_err(|e| StoreError::Other(format!("PGSSLROOTCERT {path}: {e}")))?;
-        let mut reader = std::io::BufReader::new(pem.as_slice());
+        // Parsed via rustls-pki-types rather than rustls-pemfile: the latter
+        // is unmaintained (RUSTSEC-2025-0134) and was only ever a thin
+        // wrapper over this same code.
+        use rustls::pki_types::CertificateDer;
+        use rustls::pki_types::pem::PemObject;
         let mut added = 0usize;
-        for cert in rustls_pemfile::certs(&mut reader) {
+        for cert in CertificateDer::pem_file_iter(&path)
+            .map_err(|e| StoreError::Other(format!("PGSSLROOTCERT {path}: {e}")))?
+        {
             let cert = cert.map_err(|e| StoreError::Other(format!("PGSSLROOTCERT {path}: {e}")))?;
             roots
                 .add(cert)

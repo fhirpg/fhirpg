@@ -69,4 +69,6 @@ steps:
       FHIRPG_PROPTEST_CASES: "10000"
     commands:
       - cargo test --release --locked -p fhirpg-gen --test proptest_roundtrip -- --nocapture
-      - cargo test --release --locked -p fhirpg-store -p fhirpg-server -- --nocapture
+      # One test thread: several of these install a full FHIR schema and two
+      # doing so concurrently can exhaust the server's lock budget.
+      - cargo test --release --locked -p fhirpg-store -p fhirpg-server -- --nocapture --test-threads=1

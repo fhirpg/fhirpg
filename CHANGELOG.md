@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.1 — supply chain (2026-07-26)
+
+**Fixed — a published version depended on an unmaintained crate.**
+`rustls-pemfile` is unmaintained (RUSTSEC-2025-0134) with no safe upgrade.
+The direct use is gone, replaced by `rustls-pki-types`' `PemObject` — the
+same code `rustls-pemfile` delegated to — and `axum-server` moves to 0.8,
+which drops it as well. 0.3.0 carried it transitively behind the `tls`
+feature, so a downstream `cargo deny check --all-features` failed on a
+version of fhirpg that had already shipped.
+
+The lesson is in the flag: `cargo deny check` does not see an optional
+feature's dependency tree, so the supply-chain gate only means what it says
+when it runs `--all-features`.
+
 ## 0.3.0 — M7, trustworthy under load and under audit (2026-07-25)
 
 Correctness and security work from the hardening review. Specification:

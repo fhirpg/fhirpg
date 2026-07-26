@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 keywords = ["fhir", "healthcare", "postgresql", "hl7", "medical"]
 categories = ["database", "science", "command-line-utilities"]
 edition = "2024"
@@ -18,10 +18,10 @@ repository = "https://github.com/fhirpg/fhirpg"
 rust-version = "1.90"
 
 [workspace.dependencies]
-fhirpg-map = { path = "crates/fhirpg-map", version = "0.3.0" }
-fhirpg-gen = { path = "crates/fhirpg-gen", version = "0.3.0" }
-fhirpg-store = { path = "crates/fhirpg-store", version = "0.3.0" }
-fhirpg-server = { path = "crates/fhirpg-server", version = "0.3.0" }
+fhirpg-map = { path = "crates/fhirpg-map", version = "0.3.1" }
+fhirpg-gen = { path = "crates/fhirpg-gen", version = "0.3.1" }
+fhirpg-store = { path = "crates/fhirpg-store", version = "0.3.1" }
+fhirpg-server = { path = "crates/fhirpg-server", version = "0.3.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
 thiserror = "2"

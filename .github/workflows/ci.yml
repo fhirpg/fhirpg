@@ -95,8 +95,10 @@ jobs:
           if ! cargo test --release -p fhirpg-store -p fhirpg-server \
                  -- --nocapture --test-threads=1 2>&1 | tee live-tests.log; then
             echo "::error::live-database tests failed; extract follows"
-            grep -E "^test .*(FAILED|panicked)|^---- .* ----|panicked at|assertion" \
-              live-tests.log | head -25 | while IFS= read -r l; do
+            # -A2: the panic *message* is on the line after "panicked at",
+            # and the message is the whole point.
+            grep -E -A2 "^test .*(FAILED|panicked)|^---- .* ----|panicked at|assertion" \
+              live-tests.log | head -40 | while IFS= read -r l; do
                 echo "::error::${l}"
               done
             exit 1

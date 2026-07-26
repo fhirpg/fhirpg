@@ -39,17 +39,23 @@ jobs:
           POSTGRES_USER: fhirpg
           POSTGRES_PASSWORD: fhirpg
           POSTGRES_DB: fhirpg
-          # Headroom, not a current requirement: the suites install several
-          # version schemas and touch thousands of relations per transaction,
-          # and exhausting the lock budget surfaces as a bare "out of shared
-          # memory" that costs an afternoon to attribute.
-          POSTGRES_INITDB_ARGS: "-c max_locks_per_transaction=512"
+          # Two settings, both about resources rather than behaviour.
+          # max_locks_per_transaction: the suites install several version
+          # schemas and touch thousands of relations per transaction.
+          # max_parallel_maintenance_workers=0: building thousands of indexes
+          # spawns parallel workers that allocate dynamic shared memory, and
+          # /dev/shm in a container is small. The indexes here are all on
+          # empty tables, so parallel builds buy nothing.
+          POSTGRES_INITDB_ARGS: >-
+            -c max_locks_per_transaction=512
+            -c max_parallel_maintenance_workers=0
         ports: ["5432:5432"]
         options: >-
           --health-cmd "pg_isready -U fhirpg"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+          --shm-size=1g
     env:
       PGHOST: localhost
       PGPORT: "5432"
@@ -133,7 +139,7 @@ jobs:
           hostssl all all all scram-sha-256
           HBA
           sudo chown 999:999 pgtls/pg_hba.conf
-          docker run -d --name pgtls \
+          docker run -d --name pgtls --shm-size=1g \
             -e POSTGRES_USER=fhirpg -e POSTGRES_PASSWORD=fhirpg \
             -e POSTGRES_DB=fhirpg \
             -v "$PWD/pgtls:/certs" -p 5432:5432 postgres:18 \

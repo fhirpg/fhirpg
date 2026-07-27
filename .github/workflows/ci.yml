@@ -109,6 +109,19 @@ jobs:
               done
             exit 1
           fi
+      # The suite above runs unkeyed, which is the weaker configuration and
+      # the one the tests tolerate. Without this step the MAC write path,
+      # keyed verification, and keyed checkpoints are never executed in CI —
+      # a silent gap, because the audit test is key-aware and passes either
+      # way (spec M3.16b).
+      # The key below is a throwaway constant, deliberately committed: it
+      # protects nothing, and a workflow that pulled a real key from secrets
+      # would put one in reach of every fork's pull-request runner.
+      - name: Audit suite, keyed
+        env:
+          FHIRPG_CHAIN_KEY: 4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f
+          FHIRPG_CHAIN_KEY_ID: ci
+        run: cargo test --release -p fhirpg-store --test audit -- --nocapture
 
   tls-database:
     name: TLS-only PostgreSQL

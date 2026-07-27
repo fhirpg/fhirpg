@@ -106,6 +106,13 @@ enum Cmd {
     /// Recompute every history hash chain and report any break (spec M3.16).
     /// Exits nonzero if the audit trail has been tampered with.
     VerifyAudit,
+    /// Print the chain witness: a digest over every chain head.
+    ///
+    /// Record it outside the database — a file on another host, a ticket, a
+    /// log you do not administer. The keyed tag stops rows being rewritten;
+    /// only an external witness makes wholesale deletion visible, because a
+    /// chain that no longer contains a version cannot report its absence.
+    ChainWitness,
     /// Erase a resource and its entire history (GDPR Art. 17, spec M3.18).
     ///
     /// This is the one sanctioned exception to append-only history. A
@@ -546,13 +553,31 @@ async fn run_db(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Cmd::ChainWitness => {
+            println!("{}", store.chain_witness().await?);
+        }
         Cmd::VerifyAudit => {
             let breaks = store.verify_audit().await?;
             if breaks.is_empty() {
                 // Naming the algorithms matters: a reader whose regime
                 // recognises only one of them needs to know that one was
                 // actually checked, not infer it from silence (M3.16a).
-                eprintln!("{schema}: audit chains verify (sha256, sha3-256)");
+                let layers = match store.chain_key_id() {
+                    Some(k) => format!("sha256, sha3-256, hmac-sha256 [{k}]"),
+                    None => "sha256, sha3-256".to_string(),
+                };
+                // Name the layers that actually ran. A reader whose regime
+                // recognises one of them needs to know it was checked, not
+                // infer it from silence — and "unkeyed" is a materially
+                // weaker claim that should never be implied by omission.
+                eprintln!("{schema}: audit chains verify ({layers})");
+                if store.chain_key_id().is_none() {
+                    eprintln!(
+                        "{schema}: note: no FHIRPG_CHAIN_KEY, so the chain is unkeyed. \
+                         It detects careless modification, not an attacker with SQL write \
+                         access who knows the format (spec M3.16b)."
+                    );
+                }
             } else {
                 for b in &breaks {
                     eprintln!(
@@ -708,6 +733,17 @@ async fn serve(cli: &Cli, opts: &ServeOpts<'_>) -> Result<()> {
         AuditModeArg::Async => fhirpg_server::AuditMode::async_default(),
         AuditModeArg::Off => fhirpg_server::AuditMode::Off,
     };
+    // Which tamper-evidence layers this process will actually write. Said
+    // once at startup, because "unkeyed" is a materially weaker guarantee
+    // than operators tend to assume from the presence of a hash chain.
+    match versions.values().next().and_then(|s| s.chain_key_id()) {
+        Some(k) => tracing::info!(key_id = %k, "history chains are keyed (hmac-sha256)"),
+        None => tracing::warn!(
+            "no FHIRPG_CHAIN_KEY: history chains are unkeyed. They detect careless \
+             modification and support an external witness, but not an attacker with \
+             SQL write access who knows the pre-image format (spec M3.16b)."
+        ),
+    }
     match mode {
         AuditModeArg::Off => {
             tracing::warn!("read auditing is OFF; disclosures will not be recorded");

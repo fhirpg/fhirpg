@@ -6,6 +6,7 @@
 //! (`($n::text)::numeric`), which keeps the engine's lexical-fidelity
 //! guarantees (decimal scale, partial dates) intact in both directions.
 
+pub mod chain;
 pub mod search;
 
 use std::collections::BTreeSet;
@@ -248,29 +249,14 @@ async fn snapshot(
         .map_err(StoreError::Pg)
 }
 
-/// Append one history row with its audit envelope and hash links, in one
-/// statement (spec M3.15, M3.16, M3.16a).
+/// Append one history row with its audit envelope, hash links, and keyed
+/// tag (spec M3.15, M3.16, M3.16a, M3.16b).
 ///
-/// The chain is computed in SQL rather than in Rust for two reasons: the
-/// hashed `last_updated` is then the value actually stored (`now()`, the
-/// database's clock, not the client's), and the read of the previous row's
-/// hash cannot race the insert, because both are the same statement.
-///
-/// Two chains are maintained over the same canonical bytes, SHA-256 and
-/// SHA3-256. The point is design-family diversity rather than digest length:
-/// SHA-256 is Merkle–Damgård and SHA-3 is a sponge, so the line of
-/// cryptanalysis that took MD5 and SHA-1 — both Merkle–Damgård — cannot take
-/// both. Clinical records outlive confident predictions about any one hash
-/// function. Both are FIPS-approved (180-4 and 202), so a strict regime is
-/// satisfied by either.
-///
-/// Keeping both in this one statement is what preserves the guarantees
-/// above. BLAKE3 would add a third family, but it is in neither pgcrypto nor
-/// OpenSSL, so it could only be computed outside this statement — at the
-/// cost of the atomicity that makes the chain worth having.
-///
-/// `LEFT JOIN LATERAL … ON true` is what makes the first version work: a
-/// plain subquery would yield no rows and insert nothing.
+/// Digests are computed **here, not in SQL**. They are unkeyed over a public
+/// pre-image, so a database that computes them holds everything needed to
+/// forge them — and, more decisively, a MAC can only be introduced where the
+/// database is not. See [`crate::chain`] for what each layer does and does
+/// not buy.
 #[allow(clippy::too_many_arguments)]
 async fn append_history(
     tx: &tokio_postgres::Transaction<'_>,
@@ -281,50 +267,64 @@ async fn append_history(
     op: &str,
     resource_json: Option<&String>,
     audit: &Audit,
+    keys: &crate::chain::KeyRing,
 ) -> Result<(), StoreError> {
-    // Every parameter is cast explicitly: each is used twice — once as the
-    // column value and once inside the hash — and PostgreSQL will not deduce
-    // one type for two such uses.
+    // One read gathers everything the chain commits to. It is safe to split
+    // this from the insert because the write path already holds a
+    // `SELECT … FOR UPDATE` row lock on this resource's base row, so no other
+    // writer can append a version in between.
     //
-    // The hash covers `resource::jsonb::text`, the *stored* normalized form,
-    // not the submitted text. jsonb reorders keys and rewrites number
-    // spellings, so hashing the input would make every chain fail
-    // verification the moment it was checked against what was actually saved.
-    let sql = format!(
-        "INSERT INTO \"{schema}\".\"{hist}\" \
-           (\"id\", \"version_id\", \"last_updated\", \"op\", \"resource\", \
-            \"actor\", \"actor_source\", \"client\", \"request_id\", \"reason\", \
-            \"prev_hash\", \"row_hash\", \"prev_hash_sha3\", \"row_hash_sha3\") \
-         SELECT $1::text, $2::bigint, ts.v, $3::text, ($4::text)::jsonb, \
-                $5::text, $6::text, $7::text, $8::text, $9::text, \
-                prev.\"row_hash\", \
-                sha256( \
-                  coalesce(prev.\"row_hash\", '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea) \
-                  || canon.b \
-                ), \
-                prev.\"row_hash_sha3\", \
-                digest( \
-                  coalesce(prev.\"row_hash_sha3\", '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea) \
-                  || canon.b, \
-                  'sha3-256') \
-         FROM (SELECT now() AS v) ts \
-         CROSS JOIN LATERAL ( \
-             SELECT convert_to( \
-                       $1::text || '|' || ($2::bigint)::text || '|' || ts.v::text \
-                       || '|' || $3::text || '|' \
-                       || coalesce((($4::text)::jsonb)::text, '') || '|' || $5::text, \
-                       'UTF8') AS b \
-         ) canon \
-         LEFT JOIN LATERAL ( \
-             SELECT h.\"row_hash\", h.\"row_hash_sha3\" FROM \"{schema}\".\"{hist}\" h \
-             WHERE h.\"id\" = $1::text ORDER BY h.\"version_id\" DESC LIMIT 1 \
-         ) prev ON true"
-    );
+    // The timestamp is rendered in UTC with an explicit format rather than
+    // `::text`: the default rendering follows the session's TimeZone, so a
+    // verifier connecting from another zone would recompute different bytes
+    // and report every row as broken.
+    let row = tx
+        .query_one(
+            &format!(
+                "SELECT now() AS ts, \
+                        to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') AS ts_utc, \
+                        (($1::text)::jsonb)::text AS canon, \
+                        prev.\"row_hash\", prev.\"row_hash_sha3\" \
+                 FROM (SELECT 1) one \
+                 LEFT JOIN LATERAL ( \
+                     SELECT h.\"row_hash\", h.\"row_hash_sha3\" FROM \"{schema}\".\"{hist}\" h \
+                     WHERE h.\"id\" = $2::text ORDER BY h.\"version_id\" DESC LIMIT 1 \
+                 ) prev ON true"
+            ),
+            &[&resource_json, &id],
+        )
+        .await?;
+    let ts: std::time::SystemTime = row.get(0);
+    let ts_utc: String = row.get(1);
+    // The *stored* normalized form, not the submitted text: jsonb reorders
+    // keys and rewrites number spellings, so hashing the input would make
+    // every chain fail the moment it was checked against what was saved.
+    let canon: Option<String> = row.get(2);
+    let prev_sha256: Option<Vec<u8>> = row.get(3);
+    let prev_sha3: Option<Vec<u8>> = row.get(4);
+
+    let pre = crate::chain::preimage(id, version, &ts_utc, op, canon.as_deref(), &audit.actor);
+    let (row_hash, row_hash_sha3) =
+        crate::chain::link(prev_sha256.as_deref(), prev_sha3.as_deref(), &pre);
+    let row_mac = keys
+        .signing()
+        .map(|k| crate::chain::mac(k, prev_sha256.as_deref(), &pre));
+
     tx.execute(
-        &sql,
+        &format!(
+            "INSERT INTO \"{schema}\".\"{hist}\" \
+               (\"id\", \"version_id\", \"last_updated\", \"op\", \"resource\", \
+                \"actor\", \"actor_source\", \"client\", \"request_id\", \"reason\", \
+                \"prev_hash\", \"row_hash\", \"prev_hash_sha3\", \"row_hash_sha3\", \
+                \"row_mac\") \
+             VALUES ($1::text, $2::bigint, $3::timestamptz, $4::text, ($5::text)::jsonb, \
+                     $6::text, $7::text, $8::text, $9::text, $10::text, \
+                     $11::bytea, $12::bytea, $13::bytea, $14::bytea, $15::text)"
+        ),
         &[
             &id,
             &version,
+            &ts,
             &op,
             &resource_json,
             &audit.actor,
@@ -332,6 +332,11 @@ async fn append_history(
             &audit.client,
             &audit.request_id,
             &audit.reason,
+            &prev_sha256,
+            &row_hash,
+            &prev_sha3,
+            &row_hash_sha3,
+            &row_mac,
         ],
     )
     .await?;
@@ -461,6 +466,9 @@ fn hist_entry(row: tokio_postgres::Row) -> Result<HistEntry, StoreError> {
 pub struct Store {
     pool: Pool,
     map: Arc<RelMap>,
+    /// Keys for the tamper-evidence MAC (M3.16b). Loaded once, from the
+    /// environment; never written to the database and never logged.
+    keys: crate::chain::KeyRing,
 }
 
 /// How the connection to PostgreSQL is protected (spec O10.7).
@@ -670,7 +678,15 @@ impl Store {
             .runtime(deadpool_postgres::Runtime::Tokio1)
             .build()
             .map_err(|e| StoreError::Pool(e.to_string()))?;
-        Ok(Store { pool, map })
+        let keys = crate::chain::KeyRing::from_env().map_err(StoreError::Other)?;
+        Ok(Store { pool, map, keys })
+    }
+
+    /// How the tamper-evidence chain is being kept: the signing key's id, or
+    /// `None` when unkeyed. Never exposes the key itself.
+    #[must_use]
+    pub fn chain_key_id(&self) -> Option<&str> {
+        self.keys.signing().map(crate::chain::ChainKey::id)
     }
 
     pub fn map(&self) -> &RelMap {
@@ -1139,7 +1155,18 @@ impl Store {
         let version = old.unwrap_or(0).max(last_any.unwrap_or(0)) + 1;
         insert_shredded(tx, &self.map, rm, &id, version, &out).await?;
         let op = if old.is_some() { "U" } else { "C" };
-        append_history(tx, s, &hist, &id, version, op, Some(&json), audit).await?;
+        append_history(
+            tx,
+            s,
+            &hist,
+            &id,
+            version,
+            op,
+            Some(&json),
+            audit,
+            &self.keys,
+        )
+        .await?;
         Ok(PutOutcome {
             id,
             version_id: version,
@@ -1553,7 +1580,7 @@ impl Store {
         )
         .await?;
         let version = old + 1;
-        append_history(tx, s, &hist, id, version, "D", None, audit).await?;
+        append_history(tx, s, &hist, id, version, "D", None, audit, &self.keys).await?;
         Ok(true)
     }
 
@@ -1789,31 +1816,47 @@ impl Store {
             )
             .await?;
 
-        // The tombstone: op 'X', no resource, chained to the hash it ended on.
+        // The tombstone: op 'X', no resource, terminating both chains and
+        // carrying its own keyed tag, so an erasure is itself attested.
+        let ts_utc: String = tx
+            .query_one(
+                "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')",
+                &[],
+            )
+            .await?
+            .get(0);
+        let tomb_version = last_version + 1;
+        let pre = crate::chain::preimage(id, tomb_version, &ts_utc, "X", None, &audit.actor);
+        let (tomb_256, tomb_3) =
+            crate::chain::link(terminated_hash.as_deref(), terminated_sha3.as_deref(), &pre);
+        let tomb_mac = self
+            .keys
+            .signing()
+            .map(|k| crate::chain::mac(k, terminated_hash.as_deref(), &pre));
         tx.execute(
             &format!(
                 "INSERT INTO \"{s}\".\"{hist}\" \
                    (\"id\", \"version_id\", \"last_updated\", \"op\", \"resource\", \
                     \"actor\", \"actor_source\", \"client\", \"request_id\", \"reason\", \
-                    \"prev_hash\", \"row_hash\", \"prev_hash_sha3\", \"row_hash_sha3\") \
-                 SELECT $1::text, $2::bigint, now(), 'X', NULL, \
-                        $3::text, $4::text, $5::text, $6::text, $7::text, $8::bytea, \
-                        sha256(convert_to($1::text || '|X|' || ($2::bigint)::text || '|' \
-                                          || $3::text, 'UTF8')), \
-                        $9::bytea, \
-                        digest(convert_to($1::text || '|X|' || ($2::bigint)::text || '|' \
-                                          || $3::text, 'UTF8'), 'sha3-256')"
+                    \"prev_hash\", \"row_hash\", \"prev_hash_sha3\", \"row_hash_sha3\", \
+                    \"row_mac\") \
+                 VALUES ($1::text, $2::bigint, now(), 'X', NULL, \
+                         $3::text, $4::text, $5::text, $6::text, $7::text, \
+                         $8::bytea, $9::bytea, $10::bytea, $11::bytea, $12::text)"
             ),
             &[
                 &id,
-                &(last_version + 1),
+                &tomb_version,
                 &audit.actor,
                 &audit.actor_source,
                 &audit.client,
                 &audit.request_id,
                 &audit.reason,
                 &terminated_hash,
+                &tomb_256,
                 &terminated_sha3,
+                &tomb_3,
+                &tomb_mac,
             ],
         )
         .await?;
@@ -1841,7 +1884,69 @@ impl Store {
     /// they are reported as the point the chain begins, not as tampering —
     /// claiming a break where there is only history would train an operator
     /// to ignore the report.
+    /// A digest over every chain head in the schema — the witness value
+    /// (spec M3.16b).
+    ///
+    /// Record this somewhere the database cannot reach. The MAC stops a row
+    /// being *rewritten*, but an attacker with SQL write access can still
+    /// delete rows wholesale, and a chain that no longer contains a version
+    /// cannot report its absence. Comparing today's witness against one
+    /// recorded yesterday is what makes truncation and mass deletion visible.
+    ///
+    /// The value covers `(resource type, id, last version, its two digests)`
+    /// for every chain, ordered, so it changes if any chain loses a version,
+    /// gains one, or has its head altered. Keyed when a key is configured, so
+    /// the witness itself cannot be recomputed by whoever holds only the data.
+    pub async fn chain_witness(&self) -> Result<String, StoreError> {
+        use sha2::{Digest as _, Sha256};
+        let s = &self.map.schema;
+        let client = self.pool.get().await?;
+        let mut acc = Sha256::new();
+        let mut chains = 0u64;
+        for rm in self.map.resources.values() {
+            let Some((_, hist)) = rm.find_table(TableKind::History) else {
+                continue;
+            };
+            let rows = client
+                .query(
+                    &format!(
+                        "SELECT DISTINCT ON (\"id\") \"id\", \"version_id\", \
+                                \"row_hash\", \"row_hash_sha3\" \
+                         FROM \"{s}\".\"{}\" \
+                         ORDER BY \"id\", \"version_id\" DESC",
+                        hist.name
+                    ),
+                    &[],
+                )
+                .await?;
+            for row in rows {
+                let id: String = row.get(0);
+                let version: i64 = row.get(1);
+                let h256: Option<Vec<u8>> = row.get(2);
+                let h3: Option<Vec<u8>> = row.get(3);
+                acc.update(rm.name.as_bytes());
+                acc.update(b"|");
+                acc.update(id.as_bytes());
+                acc.update(b"|");
+                acc.update(version.to_string().as_bytes());
+                acc.update(b"|");
+                acc.update(h256.unwrap_or_default());
+                acc.update(b"|");
+                acc.update(h3.unwrap_or_default());
+                acc.update(b"\n");
+                chains += 1;
+            }
+        }
+        let digest = acc.finalize();
+        let body = format!("{chains}:{}", hex_encode(&digest));
+        Ok(match self.keys.signing() {
+            Some(k) => crate::chain::mac(k, None, body.as_bytes()),
+            None => body,
+        })
+    }
+
     pub async fn verify_audit(&self) -> Result<Vec<ChainBreak>, StoreError> {
+        use crate::chain::{self, MacCheck};
         let s = &self.map.schema;
         let client = self.pool.get().await?;
         let mut breaks = Vec::new();
@@ -1849,64 +1954,117 @@ impl Store {
             let Some((_, hist)) = rm.find_table(TableKind::History) else {
                 continue;
             };
-            // Each configured algorithm is verified on its own pass and
-            // reported on its own terms (M3.16a). Recomputation happens in
-            // SQL with the same expression the writer used, so this checks
-            // the stored bytes rather than a Rust-side idea of them.
-            // `open`/`close` wrap the hashed bytes: the two functions differ
-            // in arity, so the algorithm cannot be swapped by name alone.
-            for (algorithm, hash_col, prev_col, open, close) in [
-                ("sha256", "row_hash", "prev_hash", "sha256(", ")"),
-                (
-                    "sha3-256",
-                    "row_hash_sha3",
-                    "prev_hash_sha3",
-                    "digest(",
-                    ", 'sha3-256')",
-                ),
-            ] {
-                let sql = format!(
-                    "SELECT \"id\", \"version_id\", \
-                        (\"h\" IS DISTINCT FROM \"expected\") AS bad, \
-                        (\"p\" IS DISTINCT FROM \"prior\") AS unlinked \
-                 FROM ( \
-                   SELECT h.\"id\", h.\"version_id\", h.\"{hash_col}\" AS \"h\", \
-                          h.\"{prev_col}\" AS \"p\", h.\"op\", \
-                          lag(h.\"{hash_col}\") OVER w AS prior, \
-                          {open} \
-                            coalesce(lag(h.\"{hash_col}\") OVER w, \
-                              '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea) \
-                            || convert_to( \
-                                 h.\"id\" || '|' || h.\"version_id\"::text || '|' \
-                                 || h.\"last_updated\"::text || '|' || h.\"op\" || '|' \
-                                 || coalesce(h.\"resource\"::text, '') || '|' || h.\"actor\", \
-                                 'UTF8') \
-                          {close} AS expected \
-                   FROM \"{s}\".\"{}\" h \
-                   WINDOW w AS (PARTITION BY h.\"id\" ORDER BY h.\"version_id\") \
-                 ) chain \
-                 WHERE \"h\" IS NOT NULL \
-                   AND \"op\" <> 'X' \
-                   AND ((\"h\" IS DISTINCT FROM \"expected\") \
-                        OR (\"p\" IS DISTINCT FROM \"prior\")) \
-                 ORDER BY \"id\", \"version_id\"",
-                    hist.name
-                );
-                for row in client.query(&sql, &[]).await? {
-                    let bad: Option<bool> = row.get(2);
-                    let unlinked: Option<bool> = row.get(3);
-                    breaks.push(ChainBreak {
-                        rtype: rm.name.clone(),
-                        id: row.get(0),
-                        version_id: row.get(1),
-                        algorithm,
-                        detail: match (bad.unwrap_or(false), unlinked.unwrap_or(false)) {
-                            (true, true) => "row hash and link both differ".into(),
-                            (true, false) => "row contents differ from their hash".into(),
-                            _ => "link to the previous version differs".into(),
-                        },
-                    });
+            // Rows in chain order. Recomputation happens in this process,
+            // with the same `chain::preimage` the writer used, so the two
+            // cannot drift into disagreeing about what was signed — and so
+            // the database is never told the format.
+            let rows = client
+                .query(
+                    &format!(
+                        "SELECT \"id\", \"version_id\", \
+                                to_char(\"last_updated\" AT TIME ZONE 'UTC', \
+                                        'YYYY-MM-DD HH24:MI:SS.US'), \
+                                \"op\", (\"resource\")::text, \"actor\", \
+                                \"prev_hash\", \"row_hash\", \
+                                \"prev_hash_sha3\", \"row_hash_sha3\", \"row_mac\" \
+                         FROM \"{s}\".\"{}\" ORDER BY \"id\", \"version_id\"",
+                        hist.name
+                    ),
+                    &[],
+                )
+                .await?;
+            let mut prev_id = String::new();
+            let (mut prior_256, mut prior_3): (Option<Vec<u8>>, Option<Vec<u8>>) = (None, None);
+            for row in rows {
+                let id: String = row.get(0);
+                let version_id: i64 = row.get(1);
+                let ts_utc: String = row.get(2);
+                let op: String = row.get(3);
+                let resource: Option<String> = row.get(4);
+                let actor: String = row.get(5);
+                let prev_hash: Option<Vec<u8>> = row.get(6);
+                let row_hash: Option<Vec<u8>> = row.get(7);
+                let prev_sha3: Option<Vec<u8>> = row.get(8);
+                let row_sha3: Option<Vec<u8>> = row.get(9);
+                let row_mac: Option<String> = row.get(10);
+
+                if id != prev_id {
+                    prev_id.clone_from(&id);
+                    prior_256 = None;
+                    prior_3 = None;
                 }
+                // A tombstone terminates a chain rather than continuing it
+                // (M3.18); it is not a break.
+                if op == "X" {
+                    prior_256 = row_hash;
+                    prior_3 = row_sha3;
+                    continue;
+                }
+                // Rows written before the audit columns existed carry no
+                // digest. That is where the chain begins, not tampering —
+                // claiming a break where there is only history would train an
+                // operator to ignore the report.
+                let (Some(stored_256), Some(stored_3)) = (&row_hash, &row_sha3) else {
+                    prior_256 = row_hash;
+                    prior_3 = row_sha3;
+                    continue;
+                };
+
+                let pre =
+                    chain::preimage(&id, version_id, &ts_utc, &op, resource.as_deref(), &actor);
+                let (want_256, want_3) =
+                    chain::link(prior_256.as_deref(), prior_3.as_deref(), &pre);
+
+                for (algorithm, stored, want, stored_link, prior) in [
+                    ("sha256", stored_256, &want_256, &prev_hash, &prior_256),
+                    ("sha3-256", stored_3, &want_3, &prev_sha3, &prior_3),
+                ] {
+                    let bad = !chain::digests_equal(stored, want);
+                    let unlinked = stored_link.as_deref() != prior.as_deref();
+                    if bad || unlinked {
+                        breaks.push(ChainBreak {
+                            rtype: rm.name.clone(),
+                            id: id.clone(),
+                            version_id,
+                            algorithm,
+                            detail: match (bad, unlinked) {
+                                (true, true) => "row hash and link both differ".into(),
+                                (true, false) => "row contents differ from their hash".into(),
+                                _ => "link to the previous version differs".into(),
+                            },
+                        });
+                    }
+                }
+
+                // Only a mismatch is a finding. The other outcomes say the
+                // row could not be checked, which is a different claim and
+                // must not be reported as tampering.
+                match self
+                    .keys
+                    .check(row_mac.as_deref(), prior_256.as_deref(), &pre)
+                {
+                    MacCheck::Mismatch => breaks.push(ChainBreak {
+                        rtype: rm.name.clone(),
+                        id: id.clone(),
+                        version_id,
+                        algorithm: "hmac-sha256",
+                        detail: "keyed tag does not match".into(),
+                    }),
+                    MacCheck::Ok | MacCheck::Absent => {}
+                    MacCheck::Unverifiable { key_id } => {
+                        tracing::warn!(
+                            rtype = %rm.name, %id, version_id, %key_id,
+                            "row is signed with a key this process does not hold; not checked"
+                        );
+                    }
+                    MacCheck::Malformed => tracing::warn!(
+                        rtype = %rm.name, %id, version_id,
+                        "row_mac is not <key-id>:<hex>; not checked"
+                    ),
+                }
+
+                prior_256 = row_hash;
+                prior_3 = row_sha3;
             }
         }
         Ok(breaks)

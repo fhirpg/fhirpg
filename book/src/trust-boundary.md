@@ -118,12 +118,61 @@ naming the resource and version. Rows written before the audit columns
 existed carry no hash; they are reported as the point a chain begins, not as
 tampering.
 
-Two things to know about what this proves. It detects modification of history
-by anything that bypassed the application — including a DBA with table access,
-which is the threat it exists for. It does **not** protect against an attacker
-who can also recompute and rewrite the chain; for that, ship `row_hash` values
-off-box (log shipping, WORM storage, or a notary) so the local copy is not the
-only witness.
+### What each layer proves
+
+Three layers, and they stop different things. Conflating them is how a
+deployment ends up believing it has protection it does not.
+
+| Layer | Stops | Does not stop |
+| --- | --- | --- |
+| SHA-256 + SHA3-256 digests | Careless or unaware modification: a migration, a stray `UPDATE`, a row restored from the wrong backup. Two design families, so one line of cryptanalysis cannot take both. | An attacker who knows the pre-image format — it is public, and the digests are unkeyed, so they can recompute them. |
+| `HMAC-SHA-256` tag | Forgery. Producing a valid tag needs a key held in the application process and never written to the database, so SQL write access is not enough. | A row being **deleted**. |
+| Chain witness, recorded off-box | Truncation and wholesale deletion. | — |
+
+That second row is the one worth dwelling on. Without a key, a hash chain
+proves only that nothing changed *by accident*: anyone who can write the rows
+can also write matching digests. Set `FHIRPG_CHAIN_KEY` and that stops being
+true.
+
+```sh
+# 32 bytes minimum. A placeholder like "changeme" would produce tags an
+# attacker could reproduce by guessing.
+export FHIRPG_CHAIN_KEY=$(openssl rand -hex 32)
+export FHIRPG_CHAIN_KEY_ID=k1
+```
+
+The key must not be readable by the database role. A key stored where the
+attacker already has write access protects nothing.
+
+**Rotation is additive.** Each tag records the key that signed it
+(`k1:9f86d0…`), so turning a key over does not invalidate history:
+
+```sh
+export FHIRPG_CHAIN_KEY=$(openssl rand -hex 32)   # the new signing key
+export FHIRPG_CHAIN_KEY_ID=k2
+export FHIRPG_CHAIN_KEYS_RETIRED="k1=<previous hex>"   # still verifies
+```
+
+Drop a retired key and rows signed with it become *unverifiable*, which
+`verify-audit` reports as exactly that — not as tampering. A missing tag, a
+tag naming a key you do not hold, and a malformed tag are each reported as
+what they are. Only a mismatch is a finding. Reporting a key-distribution
+problem as a forgery would burn an incident response.
+
+### The witness
+
+The tag stops a row being rewritten. It says nothing about a row that is
+simply gone: a chain missing its last version verifies perfectly, because
+nothing left behind refers to what was removed.
+
+```sh
+fhirpg chain-witness --fhir-version r5   # e.g. k1:3f2a…  or  1042:9c81…
+```
+
+Record it somewhere the database cannot reach — another host, a ticket, a log
+you do not administer — and compare periodically. It is deterministic over
+unchanged history, so a difference means a chain gained a version, lost one,
+or had its head altered.
 
 ## Erasure versus append-only history
 

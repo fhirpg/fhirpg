@@ -216,7 +216,26 @@ async fn the_hash_chain_verifies_and_catches_tampering(store: &Store) {
             "{algorithm} did not detect the tamper: {breaks:?}"
         );
     }
-    assert_eq!(breaks.len(), 2, "one break per algorithm: {breaks:?}");
+    // The keyed layer is configuration-dependent, so assert on what is
+    // actually configured rather than on a fixed count. Keyed, it must also
+    // fire: a MAC that stayed silent while both digests broke would mean the
+    // tag was recomputed from the forged row, which is the failure the key
+    // exists to prevent.
+    let keyed = std::env::var("FHIRPG_CHAIN_KEY").is_ok();
+    let mac_breaks = breaks
+        .iter()
+        .filter(|b| b.algorithm == "hmac-sha256")
+        .count();
+    if keyed {
+        assert_eq!(mac_breaks, 1, "the keyed tag must catch it too: {breaks:?}");
+    } else {
+        assert_eq!(mac_breaks, 0, "no key configured, so no tag to check");
+    }
+    assert_eq!(
+        breaks.len(),
+        if keyed { 3 } else { 2 },
+        "one break per configured layer: {breaks:?}"
+    );
 }
 
 async fn the_database_refuses_to_rewrite_history(store: &Store) {
@@ -237,4 +256,123 @@ async fn the_database_refuses_to_rewrite_history(store: &Store) {
         .execute_raw_for_test("DELETE FROM patient_history WHERE id = 'p5'")
         .await;
     assert!(delete.is_err(), "DELETE on history must be refused");
+}
+
+/// The witness makes deletion visible, which the per-row MAC cannot.
+///
+/// A MAC proves a row was not rewritten. It says nothing about a row that is
+/// simply gone — a chain missing its last version verifies perfectly, because
+/// nothing left behind refers to what was removed. Only a value recorded
+/// outside the database closes that gap.
+#[tokio::test]
+async fn the_witness_changes_when_history_is_truncated() {
+    let Some(store) = test_store("witness").await else {
+        eprintln!("skipping: FHIRPG_TEST_DB not set or spec missing");
+        return;
+    };
+    store.put(&patient("w1", "One")).await.expect("create");
+    store.put(&patient("w1", "Two")).await.expect("update");
+    let before = store.chain_witness().await.expect("witness");
+
+    // Same data, no changes: the witness must be stable, or an operator
+    // comparing it daily would drown in false alarms.
+    assert_eq!(
+        before,
+        store.chain_witness().await.expect("witness"),
+        "witness must be deterministic over unchanged history"
+    );
+
+    // Truncate: drop the newest version, the way an attacker covering a
+    // change would. Every remaining row still verifies.
+    store
+        .execute_raw_for_test(
+            "ALTER TABLE patient_history DISABLE TRIGGER ALL;\n\
+             DELETE FROM patient_history WHERE id = 'w1' AND version_id = 2;\n\
+             ALTER TABLE patient_history ENABLE TRIGGER ALL;",
+        )
+        .await
+        .expect("truncate");
+
+    let breaks = store.verify_audit().await.expect("verify");
+    assert!(
+        breaks.is_empty(),
+        "a truncated chain still verifies — that is the gap: {breaks:?}"
+    );
+    assert_ne!(
+        before,
+        store.chain_witness().await.expect("witness"),
+        "the witness must notice the missing version"
+    );
+}
+
+/// Rotation is additive against a live database, not just in unit tests.
+///
+/// The failure this guards against is subtle and expensive: turn over a key,
+/// and if the retired one is no longer loadable every historical row stops
+/// verifying at once. That looks exactly like mass tampering, which is the
+/// worst possible false positive for a control whose whole job is to be
+/// believed.
+#[tokio::test]
+async fn a_rotated_key_still_verifies_history_it_signed() {
+    let Ok(db) = std::env::var("FHIRPG_TEST_DB") else {
+        eprintln!("skipping: FHIRPG_TEST_DB not set");
+        return;
+    };
+    let Some(defs) = spec_defs() else {
+        eprintln!("skipping: no spec dir");
+        return;
+    };
+    // SAFETY: this test owns the key variables; it runs single-threaded.
+    unsafe {
+        std::env::set_var("PGDATABASE", &db);
+        std::env::set_var("FHIRPG_CHAIN_KEY", "11".repeat(32));
+        std::env::set_var("FHIRPG_CHAIN_KEY_ID", "k1");
+        std::env::remove_var("FHIRPG_CHAIN_KEYS_RETIRED");
+    }
+    let map = Arc::new(fhirpg_gen::generate(&defs, "rotate").expect("generate"));
+    let cfg = fhirpg_store::pg_config(None).expect("cfg");
+    let store = Store::connect(cfg, map.clone()).await.expect("connect");
+    store.drop_schema().await.expect("drop");
+    store.init("rotate-sum").await.expect("init");
+    store.put(&patient("r1", "Signed")).await.expect("create");
+    assert_eq!(store.chain_key_id(), Some("k1"));
+    assert!(store.verify_audit().await.expect("verify").is_empty());
+
+    // Rotate: k2 signs, k1 retired but still loadable.
+    unsafe {
+        std::env::set_var("FHIRPG_CHAIN_KEY", "22".repeat(32));
+        std::env::set_var("FHIRPG_CHAIN_KEY_ID", "k2");
+        std::env::set_var(
+            "FHIRPG_CHAIN_KEYS_RETIRED",
+            format!("k1={}", "11".repeat(32)),
+        );
+    }
+    let cfg = fhirpg_store::pg_config(None).expect("cfg");
+    let rotated = Store::connect(cfg, map.clone()).await.expect("connect");
+    assert_eq!(rotated.chain_key_id(), Some("k2"), "the new key signs");
+    rotated
+        .put(&patient("r1", "Rotated"))
+        .await
+        .expect("update");
+    assert!(
+        rotated.verify_audit().await.expect("verify").is_empty(),
+        "rows signed under k1 and k2 must both verify"
+    );
+
+    // Drop the retired key: k1's rows become unverifiable, which is not the
+    // same claim as tampered and must not be reported as a break.
+    unsafe {
+        std::env::remove_var("FHIRPG_CHAIN_KEYS_RETIRED");
+    }
+    let cfg = fhirpg_store::pg_config(None).expect("cfg");
+    let partial = Store::connect(cfg, map).await.expect("connect");
+    assert!(
+        partial.verify_audit().await.expect("verify").is_empty(),
+        "a key we no longer hold is a gap in coverage, never a finding"
+    );
+
+    unsafe {
+        std::env::remove_var("FHIRPG_CHAIN_KEY");
+        std::env::remove_var("FHIRPG_CHAIN_KEY_ID");
+    }
 }

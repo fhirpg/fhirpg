@@ -214,6 +214,44 @@ generation](#2-schema-generation), [Storage model](#3-storage-model),
   Requiring SHA-3 makes **pgcrypto a required extension**. `fhirpg init` MUST
   create it, and MUST fail with a message naming the extension if it cannot.
 
+- **M3.16b** Digests MUST be computed by the application, never by the
+  database, and a deployment SHOULD additionally keep a **keyed tag**.
+
+  The digests are unkeyed over a published pre-image, so anyone who can write
+  to the database can also produce a correct digest for what they wrote.
+  Computing them in SQL puts the means of forgery in the same place as the
+  data, and forecloses the only real fix: a **MAC whose key the database never
+  holds**. A key stored where the attacker already has write access protects
+  nothing.
+
+  What the unkeyed chain buys, stated honestly so nobody over-claims it: it
+  detects **careless or unaware modification** — a migration, a stray
+  `UPDATE`, a row restored from the wrong backup — and it supports an
+  **external witness**, because a chain head recorded off-box makes truncation
+  and wholesale rewriting detectable even against an attacker who can
+  recompute digests. It does not, alone, stop an informed attacker with SQL
+  write access.
+
+  The keyed tag is `HMAC-SHA-256` (FIPS 198-1 over 180-4, so the FIPS story
+  stays clean) over the same pre-image, stored as `<key-id>:<hex>`:
+
+  - The key MUST come from the process environment or a file the database role
+    cannot read; it MUST NOT be written to the database, logged, or sent in a
+    query. Keys MUST be at least 32 bytes: a placeholder like `changeme`
+    reaching production would yield tags an attacker could reproduce by
+    guessing.
+  - The key id MUST travel with the tag. Without it, rotating a key would
+    invalidate every historical row at once — indistinguishable from mass
+    tampering, and the same trap as silently changing a hash format. Retired
+    keys MUST stay loadable, so rotation is additive rather than a flag day.
+  - Verification MUST be constant-time. A timing oracle would let an attacker
+    with write access recover a valid tag byte by byte without ever holding
+    the key.
+  - **Only a tag mismatch is a finding.** A missing tag, a tag naming a key
+    this process does not hold, and a malformed tag MUST each be reported as
+    what they are and MUST NOT be reported as tampering. Reporting a
+    key-distribution problem as a forgery would burn an incident response.
+
   On an existing install, `init --upgrade` adds the new digest columns but
   MUST NOT backfill them. The rows are recoverable and the digests could be
   computed, but a chain assembled after the fact attests only that the rows

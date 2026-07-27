@@ -29,11 +29,6 @@ pub fn ddl(map: &RelMap) -> Vec<String> {
 pub fn ddl_in(map: &RelMap, schema: &str) -> Vec<String> {
     let mut out = Vec::new();
     let s = schema;
-    // SHA3-256 for the second hash chain (M3.16a) comes from pgcrypto's
-    // `digest`; PostgreSQL's built-in hashes stop at SHA-2. Created into the
-    // default schema rather than this one, because an extension installed
-    // per-version schema would be three copies of the same C library.
-    out.push("CREATE EXTENSION IF NOT EXISTS pgcrypto".to_string());
     out.push(format!("CREATE SCHEMA IF NOT EXISTS \"{s}\""));
     out.push(format!(
         "CREATE TABLE \"{s}\".\"fhirpg_meta\" (\"key\" text PRIMARY KEY, \"value\" text NOT NULL)"
@@ -121,6 +116,12 @@ pub fn history_audit_columns(schema: &str, table: &str) -> Vec<String> {
         // the two chains are independent and verified independently.
         ("prev_hash_sha3", "bytea"),
         ("row_hash_sha3", "bytea"),
+        // The keyed tag, `<key-id>:<hex>`, or NULL when unkeyed. The key id
+        // travels with the tag so a verifier can distinguish "signed with a
+        // key I do not hold" from "tampered with" — different claims that
+        // must never be conflated — and so rotating a key does not invalidate
+        // every historical row at once.
+        ("row_mac", "text"),
     ]
     .iter()
     .map(|(name, ty)| {
@@ -343,6 +344,7 @@ pub fn create_table(schema: &str, rm: &ResourceMap, t: &Table) -> String {
                  \x20 \"row_hash\" bytea,\n\
                  \x20 \"prev_hash_sha3\" bytea,\n\
                  \x20 \"row_hash_sha3\" bytea,\n\
+                 \x20 \"row_mac\" text,\n\
                  \x20 PRIMARY KEY (\"id\", \"version_id\")"
             );
         }

@@ -1,6 +1,6 @@
 # The storage model
 
-The full normative rules are in `spec/index.md` §3; this chapter is the
+The full normative rules are in `spec/03-storage-model.md`; this chapter is the
 tour.
 
 ## Base tables and child tables

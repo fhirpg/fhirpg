@@ -120,8 +120,8 @@ fhirpg targets mission-critical clinical deployment: transactional writes,
 version history and audit on every resource, optimistic locking, structured
 logging with `tracing`, Prometheus metrics, health/readiness endpoints,
 connection pooling, versioned migrations, and a documented backup and
-zero-downtime upgrade story. See [`spec/index.md`](spec/index.md) §
-Operations. fhirpg handles PHI: deployments must put TLS and authentication
+zero-downtime upgrade story. See
+[`spec/10-operations.md`](spec/10-operations.md). fhirpg handles PHI: deployments must put TLS and authentication
 in front of it (or terminate TLS in-process via the `tls` feature) — the
 spec defines what fhirpg guarantees and what the deployment must provide.
 
@@ -129,7 +129,7 @@ spec defines what fhirpg guarantees and what the deployment must provide.
 
 - **[The book](book/src/SUMMARY.md)** — getting started, the storage
   model, querying, search, the REST API, operations, architecture.
-- [`spec/index.md`](spec/index.md) — the normative specification.
+- [`spec/`](spec/index.md) — the normative specification, one file per section.
 - [`plan.md`](plan.md) — design decisions, risks, milestones.
 - [`tasks.md`](tasks.md) — the implementation work breakdown.
 - [`doc/benchmarks.md`](doc/benchmarks.md) — measured performance.

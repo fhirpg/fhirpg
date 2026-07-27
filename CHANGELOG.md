@@ -17,7 +17,7 @@ when it runs `--all-features`.
 ## 0.3.0 — M7, trustworthy under load and under audit (2026-07-25)
 
 Correctness and security work from the hardening review. Specification:
-[`spec/index.md`](spec/index.md) §§ 3–13; work breakdown:
+[`spec/`](spec/index.md) §§ 3–13; work breakdown:
 [`tasks.md`](tasks.md) M7.
 
 **Fixed — reads could return a resource that never existed.** A read spans

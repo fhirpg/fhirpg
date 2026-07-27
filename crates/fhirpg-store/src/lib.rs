@@ -214,6 +214,11 @@ pub struct PurgeReport {
 /// SHA-3 must be able to see the SHA-3 verdict on its own, and a break that
 /// appears under one algorithm but not the other is itself worth seeing —
 /// it means the stored digests disagree about the same bytes.
+/// `#[non_exhaustive]` so that a future algorithm or field is a patch, not a
+/// break: adding a public field to a struct callers can build or destructure
+/// exhaustively is a breaking change, and this type gained `algorithm`
+/// exactly that way.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ChainBreak {
     pub rtype: String,

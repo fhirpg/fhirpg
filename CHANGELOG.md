@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — tamper evidence that survives the database (2026-07-27)
+
+**Breaking:** `ChainBreak` gained an `algorithm` field, so a break is
+reported per algorithm rather than once. It is now `#[non_exhaustive]`, so
+the next field is a patch rather than another break. Installed schemas need
+`fhirpg init --upgrade` for the new digest, tag, and counter-signature
+columns; existing rows keep verifying, with the new chains reported as
+beginning where their first digest appears.
+
 
 **Changed — hash chains are computed by fhirpg, not by PostgreSQL.** The
 digests were computed in SQL. They are unkeyed over a published pre-image,

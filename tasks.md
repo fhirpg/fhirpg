@@ -336,6 +336,51 @@ guarantees, P2 items are reach.
   hashing the submitted text would fail verification against what was
   actually saved. *Accept met:* the `audit` suite tampers with a history row
   behind the application's back and the chain names exactly that version.
+- [x] **T59 Tamper evidence that survives the database (M3.16a-c).** Two
+  chains in two design families, a keyed tag, and an external witness.
+
+  *The correction that shaped it.* T42 computed the chain in SQL, for two
+  real reasons — it covered the database's own `now()`, and it could not race
+  the read of the previous digest. Both survive without it: the timestamp is
+  read in the same transaction and written back verbatim, and the write path
+  already holds a `SELECT … FOR UPDATE` row lock before appending history.
+  What SQL-side computation cost was the only fix that matters. The digests
+  are unkeyed over a published pre-image, so anyone who can write the rows
+  can write matching digests; the answer is a MAC, and a MAC can only be
+  introduced where the database is not. A key stored where the attacker
+  already has write access protects nothing.
+
+  *Two families, not two digests.* SHA-256 is Merkle–Damgård, SHA3-256 is a
+  sponge. MD5 and SHA-1 both fell to one line of cryptanalysis and both were
+  Merkle–Damgård; two digests from one family would have bought far less than
+  their bit counts suggest. BLAKE3 would add a third (ARX tree) and is
+  deliberately absent: it is in neither pgcrypto nor OpenSSL, and it is not
+  FIPS-approved, so it could not be the control of record where that matters.
+
+  *Three layers, three jobs.* The digests detect careless modification and
+  let an outside auditor check the chain unaided. The `HMAC-SHA-256` tag
+  resists forgery. Neither notices a row that is simply **gone** — a chain
+  missing its last version verifies perfectly, because nothing left behind
+  refers to what was removed — so `chain-witness` digests every head, and
+  checkpoints go out on an `audit_checkpoint` log target at startup, after
+  erasure, and on an interval.
+
+  *Found by looking, not by testing.* The erasure tombstone terminated only
+  the SHA-256 chain: 11 rows, 11 SHA-256 digests, 10 SHA-3. The suite was
+  green. And the pre-image hashed a timestamp rendered in the session's
+  TimeZone, so a verifier in another zone would have reported every row
+  broken — both sides now render UTC explicitly.
+
+  *A defect this work introduced.* The rotation test set `FHIRPG_CHAIN_KEY`
+  with `std::env::set_var`, which is process-global and races concurrent
+  readers — that is why it is unsafe — and cargo runs a binary's tests in
+  parallel. The symptom appeared in an unrelated test binary.
+  `Store::with_chain_keys` replaces it, which is better design anyway.
+
+  *Remaining:* nothing for the control itself. Keys are read from the
+  environment; a deployment wanting a secrets manager or an HSM needs
+  `with_chain_keys` wired to it, which is API that exists but has no CLI
+  surface.
 - [x] **T43 Worldwide string search (P6.6).** Each string search target
   column gets a `_norm` companion holding the folded value, computed in Rust
   at write time; prefix search is a range predicate against it. Closes T15's

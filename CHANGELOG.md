@@ -1,5 +1,65 @@
 # Changelog
 
+## Unreleased
+
+**Changed — hash chains are computed by fhirpg, not by PostgreSQL.** The
+digests were computed in SQL. They are unkeyed over a published pre-image,
+so a database that computes them holds everything needed to forge them — and,
+decisively, a MAC can only be introduced where the database is not. A key
+stored where an attacker already has write access protects nothing. Writing
+and verifying both moved into the application; `pgcrypto` is no longer
+required, because nothing hashes in SQL.
+
+**Added — a second chain in a second design family.** History is chained
+under SHA-256 *and* SHA3-256. The value is family diversity, not digest
+length: SHA-256 is Merkle–Damgård and SHA-3 is a sponge, so the line of
+cryptanalysis that took MD5 and SHA-1 — both Merkle–Damgård — cannot take
+both. A clinical record may be retained for decades, longer than anyone can
+promise a single hash function will stand. Both are FIPS-approved (180-4,
+202), and `verify-audit` reports each separately so a reader relies on
+whichever their regime recognises (M3.16a).
+
+**Added — a keyed tag, which is what actually resists an attacker.**
+`HMAC-SHA-256` (FIPS 198-1) over the same pre-image, keyed from
+`FHIRPG_CHAIN_KEY` and never written to the database or logged. It sits
+alongside the digests rather than replacing them, so an outside auditor
+holding only the data can still check the chain while forgery still needs
+the secret. The key id travels with the tag (`k1:9f86d0…`), so rotation is
+additive: retired keys stay loadable via `FHIRPG_CHAIN_KEYS_RETIRED` and
+turning a key over does not invalidate history all at once (M3.16b).
+
+Only a tag mismatch is a finding. A missing tag, a tag naming a key this
+process does not hold, and a malformed tag are each reported as what they
+are — reporting a key-distribution problem as forgery would burn an incident
+response.
+
+**Added — `fhirpg chain-witness` and automatic checkpoints.** A tag proves a
+row was not rewritten; it says nothing about a row that is *gone*, and a
+chain missing its last version verifies perfectly because nothing left
+behind refers to what was removed. The witness digests every chain head for
+recording off-box. Checkpoints are also emitted as INFO on an
+`audit_checkpoint` log target at startup, after every erasure, and each
+`--checkpoint-interval-mins`, so a deployment already shipping logs has a
+witness for free. The line carries only counts and digests — no PHI — so it
+can be retained longer than ordinary logs (M3.16c).
+
+A checkpoint is a witness only if it lands where the database cannot reach.
+Logs shipped off-host qualify; a log table in the same database does not.
+fhirpg cannot enforce that and does not claim to.
+
+**Fixed — the pre-image hashed a timestamp rendered in the session's
+TimeZone.** A verifier connecting from a different zone would have
+recomputed different bytes and reported every row broken. Both sides now
+render UTC explicitly.
+
+**Fixed — the erasure tombstone terminated only one chain**, leaving the
+second null at the row an auditor examines hardest. The suite passed;
+counting the columns did not.
+
+**Changed — the specification is one file per section.** `spec/index.md` had
+reached 39k against a 40k limit; it is now an index over thirteen files.
+Requirement numbers are unchanged.
+
 ## 0.3.1 — supply chain (2026-07-26)
 
 **Fixed — a published version depended on an unmaintained crate.**

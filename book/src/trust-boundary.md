@@ -174,6 +174,28 @@ you do not administer — and compare periodically. It is deterministic over
 unchanged history, so a difference means a chain gained a version, lost one,
 or had its head altered.
 
+**If you already ship logs, you already have somewhere to put it.** Every
+checkpoint is emitted as an INFO line on its own `audit_checkpoint` target:
+at startup, after any erasure, and every `--checkpoint-interval-mins`
+(default 60; `0` disables the interval, keeping the startup and erasure
+ones).
+
+```
+INFO audit_checkpoint: chain checkpoint schema=r5 keyed=true
+     reason=startup witness=k1:3f2a8c…
+```
+
+The dedicated target is the point. Route and retain `audit_checkpoint` on its
+own schedule without keeping every other line — and because a checkpoint is
+only counts and digests, with **no PHI**, it can be kept far longer than
+ordinary application logs and stored where patient data must not go.
+
+One caveat that decides whether any of this is worth anything: a checkpoint
+is a witness only if it lands where the database cannot reach. Logs shipped
+off-host qualify. Logs written to a table in this same database, or to a disk
+the same compromised account can rewrite, do not. fhirpg cannot enforce that
+and does not claim to — the guarantee belongs to your log path.
+
 ## Erasure versus append-only history
 
 GDPR Article 17 says a record must be removable. Everything above says history

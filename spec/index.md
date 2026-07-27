@@ -260,6 +260,39 @@ generation](#2-schema-generation), [Storage model](#3-storage-model),
   beginning where its first digest appears, the same treatment rows predating
   the audit columns already receive. Manufacturing evidence is worse than
   admitting its absence.
+- **M3.16c** fhirpg MUST be able to emit a **chain checkpoint**: a single
+  value covering every chain head in the schema — resource type, id, latest
+  version, and its digests — such that the value changes if any chain gains a
+  version, loses one, or has its head altered. `fhirpg chain-witness` prints
+  it, and it MUST be keyed when a key is configured, so that whoever holds
+  only the data cannot recompute a matching value.
+
+  This is what the per-row tag cannot do. A MAC proves a row was not
+  rewritten; it says nothing about a row that is **gone**, and a chain missing
+  its most recent version verifies perfectly, because nothing left behind
+  refers to what was removed. Only a value recorded outside the database
+  closes that gap.
+
+  Checkpoints are also emitted as **INFO log lines on an `audit_checkpoint`
+  target**, so a deployment already shipping logs has a witness for free. The
+  dedicated target is what makes this practical: an operator can route and
+  retain `audit_checkpoint` on its own schedule without keeping every other
+  line, and the checkpoint carries no PHI — only counts and digests — so it
+  may be retained far longer than ordinary application logs, and in places
+  patient data must not go.
+
+  A checkpoint MUST be emitted at startup and after an erasure (M3.18), and
+  SHOULD be emitted on an interval a deployment configures. Erasure is
+  singled out because it is the one sanctioned deletion: a checkpoint taken
+  immediately after it separates a recorded, intentional removal from the
+  unrecorded kind.
+
+  The value is only a witness if it lands somewhere the database cannot
+  reach. Logs shipped off-host qualify; logs written to a table in the same
+  database, or to a disk the same compromised account can rewrite, do not.
+  fhirpg cannot enforce this and MUST NOT imply it has: the guarantee is a
+  property of the deployment's log path, and the documentation MUST say so.
+
 - **M3.17** History is **append-only in the database, not merely by
   convention**. `fhirpg init` MUST emit a `BEFORE UPDATE OR DELETE` trigger
   on every history table that raises an exception, and the book MUST
@@ -525,7 +558,12 @@ generation](#2-schema-generation), [Storage model](#3-storage-model),
   direct `UPDATE`/`DELETE` on a history table is rejected by the database
   (M3.17). A test MUST also assert that tampering is caught **independently
   by each algorithm**, since a chain that only ever fails in one of them
-  proves nothing about the others.
+  proves nothing about the others. A test MUST assert that a **truncated**
+  chain still verifies clean while the checkpoint changes (M3.16c) — that
+  gap is the checkpoint's whole reason for existing, and a test that only
+  checked the checkpoint moved would not show it. A test MUST assert that
+  rotating a key leaves history signed under the retired key verifiable, and
+  that dropping that key yields *unverifiable*, never a break (M3.16b).
 
 ## 12. Trust, principal, and audit
 
@@ -603,7 +641,7 @@ trace a regulation to a numbered requirement to a test.
 | Obligation | Requirements | Evidence |
 | --- | --- | --- |
 | HIPAA §164.312(b) audit controls | M3.15, PR12.4, PR12.5 | T11.8 |
-| HIPAA §164.312(c) integrity | M3.16, M3.17, R4.4, R4.5 | T11.6, T11.8 |
+| HIPAA §164.312(c) integrity | M3.16, M3.16a, M3.16b, M3.16c, M3.17, R4.4, R4.5 | T11.6, T11.8 |
 | HIPAA §164.312(e) transmission security | O10.5, O10.7, A7.8 | live TLS smoke test |
 | HIPAA §164.502 minimum necessary | PR12.1, PR12.8 (perimeter) | boundary table |
 | GDPR Art. 17 erasure | M3.18 | purge test |

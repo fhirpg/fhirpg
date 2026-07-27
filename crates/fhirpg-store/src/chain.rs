@@ -229,6 +229,12 @@ pub struct KeyRing {
 }
 
 impl KeyRing {
+    /// Build from an explicit ordered list: the first signs, the rest verify.
+    #[must_use]
+    pub fn new(keys: Vec<ChainKey>) -> Self {
+        Self { keys }
+    }
+
     /// Load from the environment.
     ///
     /// `FHIRPG_CHAIN_KEY` (hex) with optional `FHIRPG_CHAIN_KEY_ID` is the

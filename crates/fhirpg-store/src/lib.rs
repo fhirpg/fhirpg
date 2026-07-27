@@ -682,6 +682,20 @@ impl Store {
         Ok(Store { pool, map, keys })
     }
 
+    /// Replace the chain key ring, rather than taking it from the process
+    /// environment.
+    ///
+    /// The environment is a deployment concern; a caller that wants to hold
+    /// keys another way — a secrets manager, a test — should not have to
+    /// mutate process-global state to do it. Mutating `FHIRPG_CHAIN_KEY` is
+    /// also not thread-safe, so tests that did so raced whatever else was
+    /// running.
+    #[must_use]
+    pub fn with_chain_keys(mut self, keys: crate::chain::KeyRing) -> Self {
+        self.keys = keys;
+        self
+    }
+
     /// How the tamper-evidence chain is being kept: the signing key's id, or
     /// `None` when unkeyed. Never exposes the key itself.
     #[must_use]
@@ -1869,6 +1883,11 @@ impl Store {
             versions = erased,
             "erased a resource and its history (GDPR Art. 17)"
         );
+        // Checkpoint immediately after the one sanctioned deletion (M3.16c).
+        // A witness taken here is what separates a recorded, intentional
+        // removal from the unrecorded kind: without it, both look alike to
+        // anyone comparing checkpoints later.
+        self.emit_checkpoint("after-erasure").await;
         Ok(PurgeReport {
             versions_erased: erased,
             existed: true,
@@ -1943,6 +1962,41 @@ impl Store {
             Some(k) => crate::chain::mac(k, None, body.as_bytes()),
             None => body,
         })
+    }
+
+    /// Compute a checkpoint and log it on the `audit_checkpoint` target
+    /// (spec M3.16c).
+    ///
+    /// A deployment already shipping logs gets an external witness for free.
+    /// The dedicated target lets an operator route and retain these on their
+    /// own schedule, and the line carries only counts and digests — no PHI —
+    /// so it may be kept far longer than ordinary application logs, and
+    /// somewhere patient data must not go.
+    ///
+    /// This is only a witness if the logs land where the database cannot
+    /// reach. Logs shipped off-host qualify; a log table in this same
+    /// database does not, and nothing here can enforce that.
+    pub async fn emit_checkpoint(&self, reason: &str) {
+        match self.chain_witness().await {
+            Ok(witness) => tracing::info!(
+                target: "audit_checkpoint",
+                schema = %self.map.schema,
+                fhir_version = %self.map.fhir_version,
+                keyed = self.keys.signing().is_some(),
+                %reason,
+                %witness,
+                "chain checkpoint"
+            ),
+            // Never fatal: a checkpoint that cannot be taken must not stop
+            // the server serving, but must be loud enough to notice.
+            Err(e) => tracing::error!(
+                target: "audit_checkpoint",
+                schema = %self.map.schema,
+                error = %e,
+                %reason,
+                "chain checkpoint failed"
+            ),
+        }
     }
 
     pub async fn verify_audit(&self) -> Result<Vec<ChainBreak>, StoreError> {

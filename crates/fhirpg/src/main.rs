@@ -214,6 +214,11 @@ enum Cmd {
         /// Database connection pool size. Overrides FHIRPG_POOL_SIZE.
         #[arg(long)]
         pool_size: Option<usize>,
+        /// Minutes between chain checkpoints, logged on the
+        /// `audit_checkpoint` target. 0 disables the interval; startup and
+        /// post-erasure checkpoints still happen (spec M3.16c).
+        #[arg(long, default_value_t = 60)]
+        checkpoint_interval_mins: u64,
         /// How disclosure records reach the log. `sync` commits before
         /// responding, so nothing is disclosed unrecorded, and every read
         /// pays a round trip. `async` queues in memory and writes in
@@ -393,6 +398,7 @@ async fn run_db(cli: Cli) -> Result<()> {
         no_audit_reads,
         allow_unaudited,
         audit_mode,
+        checkpoint_interval_mins,
         request_timeout,
         max_concurrent,
         max_body_mb,
@@ -416,6 +422,7 @@ async fn run_db(cli: Cli) -> Result<()> {
             no_audit_reads,
             allow_unaudited,
             audit_mode,
+            checkpoint_interval_mins,
             limits: fhirpg_server::Limits {
                 request_timeout: std::time::Duration::from_secs(request_timeout),
                 max_concurrent,
@@ -640,6 +647,7 @@ struct ServeOpts<'a> {
     no_audit_reads: bool,
     allow_unaudited: bool,
     audit_mode: AuditModeArg,
+    checkpoint_interval_mins: u64,
     limits: fhirpg_server::Limits,
     pool_size: Option<usize>,
     admin_bind: Option<String>,
@@ -736,6 +744,29 @@ async fn serve(cli: &Cli, opts: &ServeOpts<'_>) -> Result<()> {
     // Which tamper-evidence layers this process will actually write. Said
     // once at startup, because "unkeyed" is a materially weaker guarantee
     // than operators tend to assume from the presence of a hash chain.
+    // Startup checkpoint, then one per interval (spec M3.16c). A deployment
+    // already shipping logs now has an external witness without standing up
+    // anything new — provided those logs land where this database cannot
+    // reach, which fhirpg cannot enforce and does not claim.
+    for store in versions.values() {
+        store.emit_checkpoint("startup").await;
+    }
+    if opts.checkpoint_interval_mins > 0 {
+        let period = std::time::Duration::from_secs(opts.checkpoint_interval_mins * 60);
+        let stores: Vec<_> = versions.values().cloned().collect();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(period);
+            // The first tick fires immediately; startup already checkpointed.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                for store in &stores {
+                    store.emit_checkpoint("interval").await;
+                }
+            }
+        });
+    }
+
     match versions.values().next().and_then(|s| s.chain_key_id()) {
         Some(k) => tracing::info!(key_id = %k, "history chains are keyed (hmac-sha256)"),
         None => tracing::warn!(

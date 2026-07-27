@@ -312,43 +312,42 @@ async fn the_witness_changes_when_history_is_truncated() {
 /// verifying at once. That looks exactly like mass tampering, which is the
 /// worst possible false positive for a control whose whole job is to be
 /// believed.
+///
+/// Keys are passed explicitly rather than through the environment. Mutating
+/// `FHIRPG_CHAIN_KEY` is process-global and races every test running beside
+/// this one — which is how an unrelated suite started failing.
 #[tokio::test]
 async fn a_rotated_key_still_verifies_history_it_signed() {
-    let Ok(db) = std::env::var("FHIRPG_TEST_DB") else {
-        eprintln!("skipping: FHIRPG_TEST_DB not set");
+    use fhirpg_store::chain::{ChainKey, KeyRing};
+
+    let Some(setup) = test_store("rotate").await else {
+        eprintln!("skipping: FHIRPG_TEST_DB not set or spec missing");
         return;
     };
-    let Some(defs) = spec_defs() else {
-        eprintln!("skipping: no spec dir");
-        return;
+    let map =
+        Arc::new(fhirpg_gen::generate(&spec_defs().expect("defs"), "rotate").expect("generate"));
+    drop(setup);
+    let connect = |ring: KeyRing| {
+        let map = map.clone();
+        async move {
+            let cfg = fhirpg_store::pg_config(None).expect("cfg");
+            Store::connect(cfg, map)
+                .await
+                .expect("connect")
+                .with_chain_keys(ring)
+        }
     };
-    // SAFETY: this test owns the key variables; it runs single-threaded.
-    unsafe {
-        std::env::set_var("PGDATABASE", &db);
-        std::env::set_var("FHIRPG_CHAIN_KEY", "11".repeat(32));
-        std::env::set_var("FHIRPG_CHAIN_KEY_ID", "k1");
-        std::env::remove_var("FHIRPG_CHAIN_KEYS_RETIRED");
-    }
-    let map = Arc::new(fhirpg_gen::generate(&defs, "rotate").expect("generate"));
-    let cfg = fhirpg_store::pg_config(None).expect("cfg");
-    let store = Store::connect(cfg, map.clone()).await.expect("connect");
-    store.drop_schema().await.expect("drop");
-    store.init("rotate-sum").await.expect("init");
+    let k1 = ChainKey::from_hex("k1", &"11".repeat(32)).expect("k1");
+    let k2 = ChainKey::from_hex("k2", &"22".repeat(32)).expect("k2");
+
+    // Signed under k1.
+    let store = connect(KeyRing::new(vec![k1.clone()])).await;
     store.put(&patient("r1", "Signed")).await.expect("create");
     assert_eq!(store.chain_key_id(), Some("k1"));
     assert!(store.verify_audit().await.expect("verify").is_empty());
 
-    // Rotate: k2 signs, k1 retired but still loadable.
-    unsafe {
-        std::env::set_var("FHIRPG_CHAIN_KEY", "22".repeat(32));
-        std::env::set_var("FHIRPG_CHAIN_KEY_ID", "k2");
-        std::env::set_var(
-            "FHIRPG_CHAIN_KEYS_RETIRED",
-            format!("k1={}", "11".repeat(32)),
-        );
-    }
-    let cfg = fhirpg_store::pg_config(None).expect("cfg");
-    let rotated = Store::connect(cfg, map.clone()).await.expect("connect");
+    // k2 signs; k1 retired but still loadable.
+    let rotated = connect(KeyRing::new(vec![k2.clone(), k1.clone()])).await;
     assert_eq!(rotated.chain_key_id(), Some("k2"), "the new key signs");
     rotated
         .put(&patient("r1", "Rotated"))
@@ -359,20 +358,75 @@ async fn a_rotated_key_still_verifies_history_it_signed() {
         "rows signed under k1 and k2 must both verify"
     );
 
-    // Drop the retired key: k1's rows become unverifiable, which is not the
-    // same claim as tampered and must not be reported as a break.
-    unsafe {
-        std::env::remove_var("FHIRPG_CHAIN_KEYS_RETIRED");
-    }
-    let cfg = fhirpg_store::pg_config(None).expect("cfg");
-    let partial = Store::connect(cfg, map).await.expect("connect");
+    // Drop k1: its rows become unverifiable, which is a gap in coverage and
+    // never a finding.
+    let partial = connect(KeyRing::new(vec![k2])).await;
     assert!(
         partial.verify_audit().await.expect("verify").is_empty(),
         "a key we no longer hold is a gap in coverage, never a finding"
     );
+}
 
-    unsafe {
-        std::env::remove_var("FHIRPG_CHAIN_KEY");
-        std::env::remove_var("FHIRPG_CHAIN_KEY_ID");
+/// The checkpoint reaches the `audit_checkpoint` target, which is what makes
+/// "a deployment already shipping logs has a witness for free" true.
+///
+/// Asserting the target specifically matters: an operator routes and retains
+/// on that name, so a checkpoint logged anywhere else is invisible to the
+/// pipeline meant to preserve it. The line must also carry no PHI, since it
+/// is expected to outlive ordinary logs and travel where patient data
+/// must not.
+#[tokio::test]
+async fn checkpoints_are_logged_on_their_own_target_without_phi() {
+    use std::sync::{Arc as StdArc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Capture(StdArc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
+
+    let Some(store) = test_store("checkpoint").await else {
+        eprintln!("skipping: FHIRPG_TEST_DB not set or spec missing");
+        return;
+    };
+    // A distinctive family name: if it appears in the checkpoint line, the
+    // line is carrying patient data it must not.
+    store
+        .put(&patient("c1", "Zzyzxbergenstein"))
+        .await
+        .expect("create");
+
+    let sink = Capture::default();
+    let made = sink.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || made.clone())
+        .with_ansi(false)
+        .with_target(true)
+        .finish();
+    // `set_default` rather than `with_default`: the emission is async, and a
+    // closure cannot await. `#[tokio::test]` runs on a current-thread
+    // runtime, so the await stays on the thread this guard applies to.
+    let guard = tracing::subscriber::set_default(subscriber);
+    store.emit_checkpoint("test").await;
+    drop(guard);
+
+    let logged = String::from_utf8(sink.0.lock().expect("lock").clone()).expect("utf8");
+    assert!(
+        logged.contains("audit_checkpoint"),
+        "checkpoint must land on its own target: {logged}"
+    );
+    assert!(
+        logged.contains("witness="),
+        "checkpoint must carry the witness value: {logged}"
+    );
+    assert!(
+        !logged.contains("Zzyzxbergenstein"),
+        "checkpoint leaked patient data: {logged}"
+    );
 }

@@ -53,7 +53,7 @@ pub fn ddl_in(map: &RelMap, schema: &str) -> Vec<String> {
 /// in the relational map — so an upgrade applies them explicitly.
 #[must_use]
 pub fn schema_wide_objects(s: &str) -> Vec<String> {
-    let mut out = vec![access_log_table(s)];
+    let mut out = vec![access_log_table(s), countersign_table(s)];
     out.extend(access_log_indexes(s));
     out.push(append_only_guard(s));
     out
@@ -150,6 +150,31 @@ fn access_log_table(s: &str) -> String {
          \x20 \"outcome\" text NOT NULL,\n\
          \x20 \"result_count\" bigint,\n\
          \x20 \"reason\" text\n\
+         )"
+    )
+}
+
+/// Counter-signatures over history rows, appended when a key is retired
+/// (spec M3.16d).
+///
+/// A separate table rather than an update to `row_mac`, for two reasons.
+/// History is append-only, and re-signing in place would be the application
+/// doing exactly what the append-only guard exists to prevent. And the
+/// original tag is evidence: replacing it destroys the record of what the
+/// retired key attested, leaving no way to tell a legitimate re-signing from
+/// a forged one.
+fn countersign_table(s: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS \"{s}\".\"fhirpg_countersign\" (\n\
+         \x20 \"seq\" bigserial PRIMARY KEY,\n\
+         \x20 \"rtype\" text NOT NULL,\n\
+         \x20 \"id\" text NOT NULL,\n\
+         \x20 \"version_id\" bigint NOT NULL,\n\
+         \x20 \"row_mac\" text NOT NULL,\n\
+         \x20 \"signed_at\" timestamptz NOT NULL DEFAULT now(),\n\
+         \x20 \"actor\" text NOT NULL,\n\
+         \x20 \"reason\" text NOT NULL,\n\
+         \x20 UNIQUE (\"rtype\", \"id\", \"version_id\", \"row_mac\")\n\
          )"
     )
 }

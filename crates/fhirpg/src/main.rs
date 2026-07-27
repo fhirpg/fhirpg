@@ -129,6 +129,32 @@ enum Cmd {
     /// Recompute every history hash chain and report any break (spec M3.16).
     /// Exits nonzero if the audit trail has been tampered with.
     VerifyAudit,
+    /// Generate a signing key for the tamper-evidence MAC.
+    ///
+    /// Writes the file `0600` from the moment it exists. `openssl rand -hex
+    /// 32 > key` applies your umask instead — commonly giving `0644`, which
+    /// fhirpg then refuses — and leaves the secret world-readable in the gap
+    /// before you `chmod` it.
+    ChainKeyNew {
+        /// Where to write it. Refuses to overwrite.
+        path: PathBuf,
+    },
+    /// Counter-sign all history under the current signing key, so a key you
+    /// can no longer trust can be dropped.
+    ///
+    /// Only needed for a suspected compromise. Ordinary rotation is additive:
+    /// keep the old key loadable with --chain-key-retired and nothing needs
+    /// re-signing.
+    ///
+    /// Verifies everything first and refuses if anything fails, because
+    /// re-signing unverified rows would give forged history the new key's
+    /// authority. Counter-signatures are appended; the original tags are
+    /// left intact as evidence of what the retired key attested.
+    ChainResign {
+        /// Why, recorded with every counter-signature.
+        #[arg(long)]
+        reason: String,
+    },
     /// Print the chain witness: a digest over every chain head.
     ///
     /// Record it outside the database — a file on another host, a ticket, a
@@ -618,6 +644,26 @@ async fn run_db(cli: Cli) -> Result<()> {
                     println!("{id}");
                 }
             }
+        }
+        Cmd::ChainKeyNew { ref path } => {
+            let key = fhirpg_store::chain::ChainKey::generate_to_file(&cli.chain_key_id, path)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            // The key itself is never printed: a secret echoed to a terminal
+            // is a secret in a scrollback buffer and a shell history.
+            eprintln!(
+                "wrote a new signing key to {} (mode 0600), id {}",
+                path.display(),
+                key.id()
+            );
+            eprintln!("keep the previous key loadable via --chain-key-retired, or rows it");
+            eprintln!("signed become unverifiable — which is not the same as tampered.");
+            return Ok(());
+        }
+        Cmd::ChainResign { ref reason } => {
+            let audit = fhirpg_store::Audit::cli();
+            let signed = store.resign_history(&audit, reason).await?;
+            eprintln!("{schema}: counter-signed {signed} history row(s)");
+            eprintln!("{schema}: the retired key may now be dropped from --chain-key-retired");
         }
         Cmd::ChainWitness => {
             println!("{}", store.chain_witness().await?);

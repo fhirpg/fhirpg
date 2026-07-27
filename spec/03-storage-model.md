@@ -216,6 +216,41 @@
     what they are and MUST NOT be reported as tampering. Reporting a
     key-distribution problem as a forgery would burn an incident response.
 
+- **M3.16d** A key that can no longer be trusted MUST be retirable without
+  losing the history it signed. `fhirpg chain-resign` counter-signs every
+  history row under the current key.
+
+  This is only for a suspected compromise. Ordinary rotation is additive
+  (M3.16b): keep the old key loadable and nothing needs re-signing.
+
+  - Re-signing MUST verify every chain first and MUST abort entirely on any
+    finding. Re-signing rows that do not currently verify would give forged
+    history the new key's authority, which turns the recovery procedure into
+    the attack. It MUST be one transaction, so a partial re-signing cannot be
+    left behind.
+  - Counter-signatures MUST be **appended**, never written over the original
+    tag. History is append-only, and re-signing in place would be the
+    application doing what the append-only guard exists to prevent. The
+    original tag is also evidence: replacing it destroys the record of what
+    the retired key attested and leaves no way to tell a legitimate
+    re-signing from a forged one.
+  - A counter-signature MAY stand in for an original tag only where that tag
+    **cannot be checked** — absent, or naming a key no longer held. A row
+    whose own tag *mismatches* MUST remain a finding whatever later vouched
+    for it.
+  - Each counter-signature MUST record who ran it, when, and why.
+
+- **M3.16e** fhirpg MUST be able to generate a signing key
+  (`fhirpg chain-key-new`), creating the file readable only by its owner from
+  the moment it exists.
+
+  The shell equivalent, `openssl rand -hex 32 > key`, applies the process
+  umask — commonly `022`, giving a file M3.16b requires be refused — and
+  leaves the secret world-readable in the window before `chmod`. Generation
+  MUST refuse to overwrite: silently replacing a signing key would orphan
+  every row it had signed. The key MUST NOT be printed, since a secret echoed
+  to a terminal lives on in scrollback and shell history.
+
   On an existing install, `init --upgrade` adds the new digest columns but
   MUST NOT backfill them. The rows are recoverable and the digests could be
   computed, but a chain assembled after the fact attests only that the rows

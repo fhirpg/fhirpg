@@ -148,6 +148,40 @@ impl ChainKey {
         Self::from_hex(id, &hex)
     }
 
+    /// Generate a fresh 32-byte key and write it to `path` as hex, readable
+    /// only by the owner.
+    ///
+    /// Creating the file with `0600` from the start matters more than it
+    /// looks. The obvious shell equivalent, `openssl rand -hex 32 > key`,
+    /// applies the process umask — commonly `022`, giving `0644` — which
+    /// [`Self::from_file`] then refuses. Worse, the secret exists
+    /// world-readable for the moment between creation and `chmod`.
+    ///
+    /// Refuses to overwrite: silently replacing a signing key would orphan
+    /// every row it had signed.
+    ///
+    /// # Errors
+    /// If the file exists, or cannot be created.
+    pub fn generate_to_file(id: &str, path: &std::path::Path) -> Result<Self, String> {
+        use std::io::Write as _;
+        let mut secret = [0u8; 32];
+        getrandom::fill(&mut secret).map_err(|e| format!("no entropy available: {e}"))?;
+        let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(path)
+            .map_err(|e| format!("chain key {}: {e}", path.display()))?;
+        writeln!(f, "{hex}").map_err(|e| format!("chain key {}: {e}", path.display()))?;
+        Self::from_hex(id, &hex)
+    }
+
     /// Read from `FHIRPG_CHAIN_KEY` (hex) and `FHIRPG_CHAIN_KEY_ID`.
     ///
     /// Absent means unkeyed, which is a supported but weaker mode: callers

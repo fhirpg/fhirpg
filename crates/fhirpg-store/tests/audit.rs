@@ -430,3 +430,73 @@ async fn checkpoints_are_logged_on_their_own_target_without_phi() {
         "checkpoint leaked patient data: {logged}"
     );
 }
+
+/// Re-signing must refuse to launder forged history, and must let a
+/// compromised key be dropped once it has run.
+///
+/// The refusal is the important half. If re-signing worked on a tampered
+/// chain it would hand forged rows the new key's authority — turning the
+/// recovery procedure into the attack.
+#[tokio::test]
+async fn resigning_refuses_tampered_history_and_frees_the_old_key() {
+    use fhirpg_store::chain::{ChainKey, KeyRing};
+
+    let Some(setup) = test_store("resign").await else {
+        eprintln!("skipping: FHIRPG_TEST_DB not set or spec missing");
+        return;
+    };
+    let map = Arc::new(fhirpg_gen::generate(&spec_defs().expect("defs"), "resign").expect("gen"));
+    drop(setup);
+    let connect = |ring: KeyRing| {
+        let map = map.clone();
+        async move {
+            let cfg = fhirpg_store::pg_config(None).expect("cfg");
+            Store::connect(cfg, map)
+                .await
+                .expect("connect")
+                .with_chain_keys(ring)
+        }
+    };
+    let k1 = ChainKey::from_hex("k1", &"11".repeat(32)).expect("k1");
+    let k2 = ChainKey::from_hex("k2", &"22".repeat(32)).expect("k2");
+    let audit = fhirpg_store::Audit::cli();
+
+    let old = connect(KeyRing::new(vec![k1.clone()])).await;
+    old.put(&patient("s1", "One")).await.expect("create");
+    old.put(&patient("s2", "Two")).await.expect("create");
+
+    // k2 signs, k1 still loadable: this is where re-signing is done from.
+    let both = connect(KeyRing::new(vec![k2.clone(), k1.clone()])).await;
+    let signed = both
+        .resign_history(&audit, "k1 suspected compromised")
+        .await
+        .expect("resign");
+    assert!(signed >= 2, "every history row is counter-signed: {signed}");
+
+    // The point of the exercise: k1 can now be dropped and history still
+    // verifies, because the counter-signatures stand in for its tags.
+    let without_k1 = connect(KeyRing::new(vec![k2.clone()])).await;
+    assert!(
+        without_k1.verify_audit().await.expect("verify").is_empty(),
+        "counter-signed history must verify without the retired key"
+    );
+
+    // Now tamper, and confirm re-signing refuses rather than blessing it.
+    without_k1
+        .execute_raw_for_test(
+            "ALTER TABLE patient_history DISABLE TRIGGER ALL;\n\
+             UPDATE patient_history SET resource = jsonb_set(resource, '{name,0,family}', '\"Forged\"') \
+               WHERE id = 's1' AND version_id = 1;\n\
+             ALTER TABLE patient_history ENABLE TRIGGER ALL;",
+        )
+        .await
+        .expect("tamper");
+    let err = without_k1
+        .resign_history(&audit, "attempt after tampering")
+        .await
+        .expect_err("must refuse");
+    assert!(
+        format!("{err}").contains("refusing to re-sign"),
+        "unexpected error: {err}"
+    );
+}

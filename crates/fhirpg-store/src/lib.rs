@@ -1964,6 +1964,110 @@ impl Store {
         })
     }
 
+    /// Counter-sign every history row under the current signing key
+    /// (spec M3.16d), returning how many rows were signed.
+    ///
+    /// For retiring a key you can no longer trust — a suspected compromise —
+    /// where keeping it loadable is not an option. Rotation alone is
+    /// additive and needs none of this: old rows stay verifiable as long as
+    /// the old key is kept.
+    ///
+    /// **Verification runs first, and any finding aborts the whole
+    /// operation.** Re-signing rows that do not currently verify would
+    /// launder forged history into the new key's authority, which is the
+    /// one thing this must never do. It is a single transaction, so a
+    /// partial re-signing cannot be left behind either.
+    ///
+    /// Counter-signatures are appended, never written over `row_mac`. The
+    /// original tag is evidence: replacing it would destroy the record of
+    /// what the retired key attested, and leave no way to distinguish a
+    /// legitimate re-signing from a forged one.
+    ///
+    /// # Errors
+    /// If no key is configured, if any chain fails verification, or on a
+    /// database error.
+    pub async fn resign_history(&self, audit: &Audit, reason: &str) -> Result<u64, StoreError> {
+        let Some(key) = self.keys.signing() else {
+            return Err(StoreError::Other(
+                "re-signing needs a signing key; pass --chain-key-file".into(),
+            ));
+        };
+        let breaks = self.verify_audit().await?;
+        if !breaks.is_empty() {
+            return Err(StoreError::Other(format!(
+                "refusing to re-sign: {} chain break(s) found, first {}/{} version {} [{}]: {}. \
+                 Re-signing unverified history would give forged rows the new key's authority.",
+                breaks.len(),
+                breaks[0].rtype,
+                breaks[0].id,
+                breaks[0].version_id,
+                breaks[0].algorithm,
+                breaks[0].detail
+            )));
+        }
+
+        let s = &self.map.schema;
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let mut signed = 0u64;
+        for rm in self.map.resources.values() {
+            let Some((_, hist)) = rm.find_table(TableKind::History) else {
+                continue;
+            };
+            let rows = tx
+                .query(
+                    &format!(
+                        "SELECT \"id\", \"version_id\", \
+                                to_char(\"last_updated\" AT TIME ZONE 'UTC', \
+                                        'YYYY-MM-DD HH24:MI:SS.US'), \
+                                \"op\", (\"resource\")::text, \"actor\", \"prev_hash\" \
+                         FROM \"{s}\".\"{}\" ORDER BY \"id\", \"version_id\"",
+                        hist.name
+                    ),
+                    &[],
+                )
+                .await?;
+            for row in rows {
+                let id: String = row.get(0);
+                let version_id: i64 = row.get(1);
+                let ts_utc: String = row.get(2);
+                let op: String = row.get(3);
+                let resource: Option<String> = row.get(4);
+                let actor: String = row.get(5);
+                let prev: Option<Vec<u8>> = row.get(6);
+                let pre = crate::chain::preimage(
+                    &id,
+                    version_id,
+                    &ts_utc,
+                    &op,
+                    resource.as_deref(),
+                    &actor,
+                );
+                let tag = crate::chain::mac(key, prev.as_deref(), &pre);
+                tx.execute(
+                    &format!(
+                        "INSERT INTO \"{s}\".\"fhirpg_countersign\" \
+                           (\"rtype\", \"id\", \"version_id\", \"row_mac\", \"actor\", \"reason\") \
+                         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING"
+                    ),
+                    &[&rm.name, &id, &version_id, &tag, &audit.actor, &reason],
+                )
+                .await?;
+                signed += 1;
+            }
+        }
+        tx.commit().await?;
+        tracing::warn!(
+            key_id = key.id(),
+            actor = %audit.actor,
+            %reason,
+            rows = signed,
+            "counter-signed history under a new key"
+        );
+        self.emit_checkpoint("after-resign").await;
+        Ok(signed)
+    }
+
     /// Compute a checkpoint and log it on the `audit_checkpoint` target
     /// (spec M3.16c).
     ///
@@ -2027,6 +2131,20 @@ impl Store {
                     &[],
                 )
                 .await?;
+            let countersigns: std::collections::HashMap<(String, i64), String> = client
+                .query(
+                    &format!(
+                        "SELECT \"id\", \"version_id\", \"row_mac\" \
+                         FROM \"{s}\".\"fhirpg_countersign\" WHERE \"rtype\" = $1"
+                    ),
+                    &[&rm.name],
+                )
+                .await
+                // A schema predating the table verifies exactly as before.
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| ((r.get(0), r.get(1)), r.get(2)))
+                .collect();
             let mut prev_id = String::new();
             let (mut prior_256, mut prior_3): (Option<Vec<u8>>, Option<Vec<u8>>) = (None, None);
             for row in rows {
@@ -2093,10 +2211,31 @@ impl Store {
                 // Only a mismatch is a finding. The other outcomes say the
                 // row could not be checked, which is a different claim and
                 // must not be reported as tampering.
-                match self
+                let own = self
                     .keys
-                    .check(row_mac.as_deref(), prior_256.as_deref(), &pre)
-                {
+                    .check(row_mac.as_deref(), prior_256.as_deref(), &pre);
+                // A counter-signature stands in once a key has been retired
+                // (M3.16d), but only where the original tag cannot be
+                // checked. A row whose own tag *mismatches* stays a finding
+                // regardless of what later vouched for it — otherwise
+                // re-signing would be a way to bless forged history.
+                let verdict = match (&own, countersigns.get(&(id.clone(), version_id))) {
+                    (MacCheck::Absent | MacCheck::Unverifiable { .. }, Some(have)) => {
+                        match self.keys.signing() {
+                            Some(k)
+                                if chain::digests_equal(
+                                    chain::mac(k, prior_256.as_deref(), &pre).as_bytes(),
+                                    have.as_bytes(),
+                                ) =>
+                            {
+                                MacCheck::Ok
+                            }
+                            _ => own,
+                        }
+                    }
+                    _ => own,
+                };
+                match verdict {
                     MacCheck::Mismatch => breaks.push(ChainBreak {
                         rtype: rm.name.clone(),
                         id: id.clone(),

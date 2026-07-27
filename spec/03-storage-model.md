@@ -185,11 +185,25 @@
   The keyed tag is `HMAC-SHA-256` (FIPS 198-1 over 180-4, so the FIPS story
   stays clean) over the same pre-image, stored as `<key-id>:<hex>`:
 
-  - The key MUST come from the process environment or a file the database role
-    cannot read; it MUST NOT be written to the database, logged, or sent in a
-    query. Keys MUST be at least 32 bytes: a placeholder like `changeme`
-    reaching production would yield tags an attacker could reproduce by
-    guessing.
+  - The key MUST NOT be written to the database, logged, or sent in a query,
+    and MUST be at least 32 bytes: a placeholder like `changeme` reaching
+    production would yield tags an attacker could reproduce by guessing.
+  - A **file** SHOULD be the source, and MUST be supported. An environment
+    variable is visible in `/proc/<pid>/environ`, survives into crash dumps,
+    is reported by orchestrators, and is inherited by every child process; a
+    file is none of those, and is what Kubernetes secrets and systemd
+    credentials already produce. A key file readable by group or other MUST
+    be **refused**, not warned about — a warning is read once at startup
+    while the file stays readable for the life of the deployment.
+  - Key material SHOULD be zeroed when dropped. Freed memory is not scrubbed,
+    so a key otherwise lingers in the heap and is recoverable from a core
+    dump.
+  - A retired key that cannot be read MUST be an error, never a silent
+    omission. Dropping one turns its rows *unverifiable*, and an operator who
+    did not intend that should learn it at startup rather than from an audit.
+  - Key configuration MUST apply to every command that reads history, not
+    only the server. Verification without the key reports every keyed row as
+    unverifiable, which is correct and useless.
   - The key id MUST travel with the tag. Without it, rotating a key would
     invalidate every historical row at once — indistinguishable from mass
     tampering, and the same trap as silently changing a hash format. Retired

@@ -61,8 +61,14 @@ use sha2::{Digest as _, Sha256};
 use sha3::Sha3_256;
 
 /// The signing key for keyed mode, and the id recorded alongside each row.
-#[derive(Clone)]
+///
+/// The secret is zeroed when the key is dropped. Freed memory is not
+/// scrubbed by default, so a key would otherwise linger in the heap and be
+/// recoverable from a core dump or a crash report — which is a longer life
+/// than a secret should have.
+#[derive(Clone, zeroize::ZeroizeOnDrop)]
 pub struct ChainKey {
+    #[zeroize(skip)]
     id: String,
     secret: Vec<u8>,
 }
@@ -107,6 +113,39 @@ impl ChainKey {
             id: id.to_string(),
             secret,
         })
+    }
+
+    /// Read a key from a file, rejecting one any other account can read.
+    ///
+    /// Preferred over the environment. A variable is visible in
+    /// `/proc/<pid>/environ`, survives into crash dumps, is reported by
+    /// orchestrators and `docker inspect`, and is inherited by every child
+    /// process. A file is none of those, is what Kubernetes secrets and
+    /// systemd credentials already produce, and can have its permissions
+    /// checked — which this does, because a key readable by the whole
+    /// machine is not a key.
+    ///
+    /// # Errors
+    /// If the file is missing, group- or world-readable, or not a valid key.
+    pub fn from_file(id: &str, path: &std::path::Path) -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let meta = std::fs::metadata(path)
+                .map_err(|e| format!("chain key {}: {e}", path.display()))?;
+            let mode = meta.permissions().mode() & 0o077;
+            if mode != 0 {
+                return Err(format!(
+                    "chain key {} is readable by group or other (mode {:o}); \
+                     chmod 600 it",
+                    path.display(),
+                    meta.permissions().mode() & 0o777
+                ));
+            }
+        }
+        let hex = std::fs::read_to_string(path)
+            .map_err(|e| format!("chain key {}: {e}", path.display()))?;
+        Self::from_hex(id, &hex)
     }
 
     /// Read from `FHIRPG_CHAIN_KEY` (hex) and `FHIRPG_CHAIN_KEY_ID`.
@@ -235,11 +274,36 @@ impl KeyRing {
         Self { keys }
     }
 
+    /// Load from files: one signing key, plus retired keys that verify.
+    ///
+    /// `retired` entries are `id=path`. Any key whose file cannot be read is
+    /// an error rather than a silent omission — a retired key quietly
+    /// dropped turns its rows *unverifiable*, and an operator who did not
+    /// intend that should hear about it at startup, not from an audit.
+    ///
+    /// # Errors
+    /// If any key is missing, badly permissioned, or malformed.
+    pub fn from_files(
+        signing: Option<(&str, &std::path::Path)>,
+        retired: &[(String, std::path::PathBuf)],
+    ) -> Result<Self, String> {
+        let mut keys = Vec::new();
+        if let Some((id, path)) = signing {
+            keys.push(ChainKey::from_file(id, path)?);
+        }
+        for (id, path) in retired {
+            keys.push(ChainKey::from_file(id, path)?);
+        }
+        Ok(Self { keys })
+    }
+
     /// Load from the environment.
     ///
     /// `FHIRPG_CHAIN_KEY` (hex) with optional `FHIRPG_CHAIN_KEY_ID` is the
     /// signing key. `FHIRPG_CHAIN_KEYS_RETIRED` holds `id=hex` pairs,
     /// comma-separated, which verify but never sign.
+    ///
+    /// Weaker than [`Self::from_files`]: see [`ChainKey::from_file`].
     ///
     /// # Errors
     /// If any key is present but unusable.
@@ -448,6 +512,52 @@ mod tests {
         assert!(digests_equal(&[1, 2, 3], &[1, 2, 3]));
         assert!(!digests_equal(&[1, 2, 3], &[1, 2, 4]));
         assert!(!digests_equal(&[1, 2, 3], &[1, 2]));
+    }
+
+    /// A key file the rest of the machine can read is not a key. Refusing
+    /// is better than warning: a warning at startup is read once, and the
+    /// file stays readable for the life of the deployment.
+    #[test]
+    #[cfg(unix)]
+    fn a_group_readable_key_file_is_refused() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("fhirpg-keytest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("chain.key");
+        let mut f = std::fs::File::create(&path).expect("create");
+        f.write_all(&b"ab".repeat(32)).expect("write");
+        drop(f);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        let err = ChainKey::from_file("k", &path).expect_err("0640 must be refused");
+        assert!(err.contains("group or other"), "unhelpful message: {err}");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let key = ChainKey::from_file("k", &path).expect("0600 is fine");
+        assert_eq!(key.id(), "k");
+
+        // Trailing newline is what every editor and `openssl rand ... >` adds.
+        std::fs::write(&path, format!("{}\n", "ab".repeat(32))).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        assert!(
+            ChainKey::from_file("k", &path).is_ok(),
+            "a trailing newline must not break a key file"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A retired key that cannot be read is an error, not a silent omission.
+    /// Dropping one turns its rows unverifiable, and an operator who did not
+    /// intend that should hear about it at startup rather than from an audit.
+    #[test]
+    fn an_unreadable_retired_key_is_an_error() {
+        let missing = std::path::PathBuf::from("/nonexistent/fhirpg/retired.key");
+        let err = KeyRing::from_files(None, &[("k1".to_string(), missing)])
+            .expect_err("must not silently skip");
+        assert!(err.contains("k1") || err.contains("retired.key"), "{err}");
     }
 
     /// Pins the exact bytes committed to. If this changes, every stored chain

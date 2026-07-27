@@ -23,6 +23,25 @@ struct Cli {
     /// Directory holding generated map assets.
     #[arg(long, global = true, env = "FHIRPG_ASSETS", default_value = "assets")]
     assets: PathBuf,
+    /// File holding the hex signing key for the tamper-evidence MAC.
+    ///
+    /// Global, not just for `serve`: `verify-audit` and `chain-witness` need
+    /// the same key, and without it every keyed row reports as
+    /// *unverifiable* — which is correct but useless.
+    ///
+    /// Preferred over FHIRPG_CHAIN_KEY: an environment variable is visible
+    /// in /proc, survives into crash dumps, is reported by orchestrators,
+    /// and is inherited by child processes. The file must not be readable by
+    /// group or other. This is the shape Kubernetes secrets and systemd
+    /// credentials already produce.
+    #[arg(long, global = true, value_name = "PATH")]
+    chain_key_file: Option<PathBuf>,
+    /// Identifier recorded with each tag, e.g. `k1`.
+    #[arg(long, global = true, default_value = "k1")]
+    chain_key_id: String,
+    /// A retired key that verifies but never signs, as `id=path`. Repeatable.
+    #[arg(long, global = true, value_name = "ID=PATH")]
+    chain_key_retired: Vec<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -52,6 +71,10 @@ enum AuditModeArg {
     Off,
 }
 
+// `Serve` carries every deployment flag and dwarfs the others. Boxing it
+// would fight clap's derive for no benefit: this enum is constructed once,
+// from the command line, and never in a hot path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Regenerate relational-map assets from FHIR specification packages.
@@ -284,6 +307,40 @@ fn load_map(assets: &Path, schema: &str) -> Result<RelMap> {
     RelMap::from_gz_bytes(&bytes).context("corrupt map asset")
 }
 
+/// Build the chain key ring from the global flags, falling back to the
+/// environment.
+///
+/// Every command that touches history needs this, not just `serve`:
+/// `verify-audit` without the key reports every keyed row as *unverifiable*,
+/// which is correct and useless.
+fn chain_keys(cli: &Cli) -> Result<fhirpg_store::chain::KeyRing> {
+    if let Some(path) = &cli.chain_key_file {
+        let retired: Result<Vec<_>> = cli
+            .chain_key_retired
+            .iter()
+            .map(|entry| {
+                let (id, p) = entry
+                    .split_once('=')
+                    .with_context(|| format!("--chain-key-retired {entry:?} is not id=path"))?;
+                Ok((id.to_string(), PathBuf::from(p)))
+            })
+            .collect();
+        return fhirpg_store::chain::KeyRing::from_files(
+            Some((cli.chain_key_id.as_str(), path.as_path())),
+            &retired?,
+        )
+        .map_err(|e| anyhow::anyhow!(e));
+    }
+    if std::env::var_os("FHIRPG_CHAIN_KEY").is_some() {
+        tracing::warn!(
+            "chain key came from FHIRPG_CHAIN_KEY. An environment variable is visible in \
+             /proc, survives into crash dumps, is reported by orchestrators, and is \
+             inherited by child processes. Prefer --chain-key-file (spec M3.16b)."
+        );
+    }
+    fhirpg_store::chain::KeyRing::from_env().map_err(|e| anyhow::anyhow!(e))
+}
+
 fn map_checksum(assets: &Path, schema: &str) -> Result<String> {
     let bytes = asset_bytes(assets, schema)?;
     let mut h = Sha256::new();
@@ -438,7 +495,9 @@ async fn run_db(cli: Cli) -> Result<()> {
     let schema = cli.fhir_version.schema();
     let map = Arc::new(load_map(&cli.assets, schema)?);
     let cfg = fhirpg_store::pg_config(cli.dsn.as_deref())?;
-    let store = fhirpg_store::Store::connect(cfg, map.clone()).await?;
+    let store = fhirpg_store::Store::connect(cfg, map.clone())
+        .await?
+        .with_chain_keys(chain_keys(&cli)?);
     // CLI writes are attributable to the operator at the keyboard: a load or
     // a delete run by hand is exactly the kind of change an audit asks about
     // later (spec M3.15).
@@ -744,6 +803,19 @@ async fn serve(cli: &Cli, opts: &ServeOpts<'_>) -> Result<()> {
     // Which tamper-evidence layers this process will actually write. Said
     // once at startup, because "unkeyed" is a materially weaker guarantee
     // than operators tend to assume from the presence of a hash chain.
+    // Applied to every mounted version, so a keyed deployment signs and
+    // verifies consistently across releases.
+    let ring = chain_keys(cli)?;
+    if !ring.is_empty() {
+        versions = versions
+            .into_iter()
+            .map(|(v, store)| {
+                let store = Arc::into_inner(store).expect("sole owner at startup");
+                (v, Arc::new(store.with_chain_keys(ring.clone())))
+            })
+            .collect();
+    }
+
     // Startup checkpoint, then one per interval (spec M3.16c). A deployment
     // already shipping logs now has an external witness without standing up
     // anything new — provided those logs land where this database cannot

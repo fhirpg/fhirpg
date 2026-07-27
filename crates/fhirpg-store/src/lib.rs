@@ -207,12 +207,19 @@ pub struct PurgeReport {
     pub existed: bool,
 }
 
-/// A break in one resource's hash chain (spec M3.16).
+/// A break in one resource's hash chain (spec M3.16, M3.16a).
+///
+/// One break per algorithm, never merged: a regime that recognises only
+/// SHA-3 must be able to see the SHA-3 verdict on its own, and a break that
+/// appears under one algorithm but not the other is itself worth seeing —
+/// it means the stored digests disagree about the same bytes.
 #[derive(Debug, Clone)]
 pub struct ChainBreak {
     pub rtype: String,
     pub id: String,
     pub version_id: i64,
+    /// `"sha256"` or `"sha3-256"`.
+    pub algorithm: &'static str,
     pub detail: String,
 }
 
@@ -241,13 +248,26 @@ async fn snapshot(
         .map_err(StoreError::Pg)
 }
 
-/// Append one history row with its audit envelope and hash link, in one
-/// statement (spec M3.15, M3.16).
+/// Append one history row with its audit envelope and hash links, in one
+/// statement (spec M3.15, M3.16, M3.16a).
 ///
 /// The chain is computed in SQL rather than in Rust for two reasons: the
 /// hashed `last_updated` is then the value actually stored (`now()`, the
 /// database's clock, not the client's), and the read of the previous row's
 /// hash cannot race the insert, because both are the same statement.
+///
+/// Two chains are maintained over the same canonical bytes, SHA-256 and
+/// SHA3-256. The point is design-family diversity rather than digest length:
+/// SHA-256 is Merkle–Damgård and SHA-3 is a sponge, so the line of
+/// cryptanalysis that took MD5 and SHA-1 — both Merkle–Damgård — cannot take
+/// both. Clinical records outlive confident predictions about any one hash
+/// function. Both are FIPS-approved (180-4 and 202), so a strict regime is
+/// satisfied by either.
+///
+/// Keeping both in this one statement is what preserves the guarantees
+/// above. BLAKE3 would add a third family, but it is in neither pgcrypto nor
+/// OpenSSL, so it could only be computed outside this statement — at the
+/// cost of the atomicity that makes the chain worth having.
 ///
 /// `LEFT JOIN LATERAL … ON true` is what makes the first version work: a
 /// plain subquery would yield no rows and insert nothing.
@@ -274,21 +294,29 @@ async fn append_history(
         "INSERT INTO \"{schema}\".\"{hist}\" \
            (\"id\", \"version_id\", \"last_updated\", \"op\", \"resource\", \
             \"actor\", \"actor_source\", \"client\", \"request_id\", \"reason\", \
-            \"prev_hash\", \"row_hash\") \
+            \"prev_hash\", \"row_hash\", \"prev_hash_sha3\", \"row_hash_sha3\") \
          SELECT $1::text, $2::bigint, ts.v, $3::text, ($4::text)::jsonb, \
                 $5::text, $6::text, $7::text, $8::text, $9::text, \
                 prev.\"row_hash\", \
                 sha256( \
                   coalesce(prev.\"row_hash\", '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea) \
-                  || convert_to( \
+                  || canon.b \
+                ), \
+                prev.\"row_hash_sha3\", \
+                digest( \
+                  coalesce(prev.\"row_hash_sha3\", '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea) \
+                  || canon.b, \
+                  'sha3-256') \
+         FROM (SELECT now() AS v) ts \
+         CROSS JOIN LATERAL ( \
+             SELECT convert_to( \
                        $1::text || '|' || ($2::bigint)::text || '|' || ts.v::text \
                        || '|' || $3::text || '|' \
                        || coalesce((($4::text)::jsonb)::text, '') || '|' || $5::text, \
-                       'UTF8') \
-                ) \
-         FROM (SELECT now() AS v) ts \
+                       'UTF8') AS b \
+         ) canon \
          LEFT JOIN LATERAL ( \
-             SELECT h.\"row_hash\" FROM \"{schema}\".\"{hist}\" h \
+             SELECT h.\"row_hash\", h.\"row_hash_sha3\" FROM \"{schema}\".\"{hist}\" h \
              WHERE h.\"id\" = $1::text ORDER BY h.\"version_id\" DESC LIMIT 1 \
          ) prev ON true"
     );
@@ -1728,7 +1756,8 @@ impl Store {
         let last = tx
             .query_opt(
                 &format!(
-                    "SELECT \"version_id\", \"row_hash\" FROM \"{s}\".\"{hist}\" \
+                    "SELECT \"version_id\", \"row_hash\", \"row_hash_sha3\" \
+                     FROM \"{s}\".\"{hist}\" \
                      WHERE \"id\" = $1 ORDER BY \"version_id\" DESC LIMIT 1"
                 ),
                 &[&id],
@@ -1742,6 +1771,10 @@ impl Store {
         };
         let last_version: i64 = last.get(0);
         let terminated_hash: Option<Vec<u8>> = last.get(1);
+        // Both chains are terminated, not just SHA-256. A tombstone that
+        // recorded one and left the other null would leave the second chain
+        // with a hole at exactly the point an auditor looks hardest.
+        let terminated_sha3: Option<Vec<u8>> = last.get(2);
 
         // Current rows first: the child tables cascade from the base row.
         tx.execute(
@@ -1762,11 +1795,14 @@ impl Store {
                 "INSERT INTO \"{s}\".\"{hist}\" \
                    (\"id\", \"version_id\", \"last_updated\", \"op\", \"resource\", \
                     \"actor\", \"actor_source\", \"client\", \"request_id\", \"reason\", \
-                    \"prev_hash\", \"row_hash\") \
+                    \"prev_hash\", \"row_hash\", \"prev_hash_sha3\", \"row_hash_sha3\") \
                  SELECT $1::text, $2::bigint, now(), 'X', NULL, \
                         $3::text, $4::text, $5::text, $6::text, $7::text, $8::bytea, \
                         sha256(convert_to($1::text || '|X|' || ($2::bigint)::text || '|' \
-                                          || $3::text, 'UTF8'))"
+                                          || $3::text, 'UTF8')), \
+                        $9::bytea, \
+                        digest(convert_to($1::text || '|X|' || ($2::bigint)::text || '|' \
+                                          || $3::text, 'UTF8'), 'sha3-256')"
             ),
             &[
                 &id,
@@ -1777,6 +1813,7 @@ impl Store {
                 &audit.request_id,
                 &audit.reason,
                 &terminated_hash,
+                &terminated_sha3,
             ],
         )
         .await?;
@@ -1812,45 +1849,64 @@ impl Store {
             let Some((_, hist)) = rm.find_table(TableKind::History) else {
                 continue;
             };
-            let sql = format!(
-                "SELECT \"id\", \"version_id\", \
-                        (\"row_hash\" IS DISTINCT FROM \"expected\") AS bad, \
-                        (\"prev_hash\" IS DISTINCT FROM \"prior\") AS unlinked \
+            // Each configured algorithm is verified on its own pass and
+            // reported on its own terms (M3.16a). Recomputation happens in
+            // SQL with the same expression the writer used, so this checks
+            // the stored bytes rather than a Rust-side idea of them.
+            // `open`/`close` wrap the hashed bytes: the two functions differ
+            // in arity, so the algorithm cannot be swapped by name alone.
+            for (algorithm, hash_col, prev_col, open, close) in [
+                ("sha256", "row_hash", "prev_hash", "sha256(", ")"),
+                (
+                    "sha3-256",
+                    "row_hash_sha3",
+                    "prev_hash_sha3",
+                    "digest(",
+                    ", 'sha3-256')",
+                ),
+            ] {
+                let sql = format!(
+                    "SELECT \"id\", \"version_id\", \
+                        (\"h\" IS DISTINCT FROM \"expected\") AS bad, \
+                        (\"p\" IS DISTINCT FROM \"prior\") AS unlinked \
                  FROM ( \
-                   SELECT h.\"id\", h.\"version_id\", h.\"row_hash\", h.\"prev_hash\", h.\"op\", \
-                          lag(h.\"row_hash\") OVER w AS prior, \
-                          sha256( \
-                            coalesce(lag(h.\"row_hash\") OVER w, \
+                   SELECT h.\"id\", h.\"version_id\", h.\"{hash_col}\" AS \"h\", \
+                          h.\"{prev_col}\" AS \"p\", h.\"op\", \
+                          lag(h.\"{hash_col}\") OVER w AS prior, \
+                          {open} \
+                            coalesce(lag(h.\"{hash_col}\") OVER w, \
                               '\\x0000000000000000000000000000000000000000000000000000000000000000'::bytea) \
                             || convert_to( \
                                  h.\"id\" || '|' || h.\"version_id\"::text || '|' \
                                  || h.\"last_updated\"::text || '|' || h.\"op\" || '|' \
                                  || coalesce(h.\"resource\"::text, '') || '|' || h.\"actor\", \
                                  'UTF8') \
-                          ) AS expected \
+                          {close} AS expected \
                    FROM \"{s}\".\"{}\" h \
                    WINDOW w AS (PARTITION BY h.\"id\" ORDER BY h.\"version_id\") \
                  ) chain \
-                 WHERE \"row_hash\" IS NOT NULL \
+                 WHERE \"h\" IS NOT NULL \
                    AND \"op\" <> 'X' \
-                   AND ((\"row_hash\" IS DISTINCT FROM \"expected\") \
-                        OR (\"prev_hash\" IS DISTINCT FROM \"prior\")) \
+                   AND ((\"h\" IS DISTINCT FROM \"expected\") \
+                        OR (\"p\" IS DISTINCT FROM \"prior\")) \
                  ORDER BY \"id\", \"version_id\"",
-                hist.name
-            );
-            for row in client.query(&sql, &[]).await? {
-                let bad: Option<bool> = row.get(2);
-                let unlinked: Option<bool> = row.get(3);
-                breaks.push(ChainBreak {
-                    rtype: rm.name.clone(),
-                    id: row.get(0),
-                    version_id: row.get(1),
-                    detail: match (bad.unwrap_or(false), unlinked.unwrap_or(false)) {
-                        (true, true) => "row hash and link both differ".into(),
-                        (true, false) => "row contents differ from their hash".into(),
-                        _ => "link to the previous version differs".into(),
-                    },
-                });
+                    hist.name
+                );
+                for row in client.query(&sql, &[]).await? {
+                    let bad: Option<bool> = row.get(2);
+                    let unlinked: Option<bool> = row.get(3);
+                    breaks.push(ChainBreak {
+                        rtype: rm.name.clone(),
+                        id: row.get(0),
+                        version_id: row.get(1),
+                        algorithm,
+                        detail: match (bad.unwrap_or(false), unlinked.unwrap_or(false)) {
+                            (true, true) => "row hash and link both differ".into(),
+                            (true, false) => "row contents differ from their hash".into(),
+                            _ => "link to the previous version differs".into(),
+                        },
+                    });
+                }
             }
         }
         Ok(breaks)

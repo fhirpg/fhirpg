@@ -549,12 +549,15 @@ async fn run_db(cli: Cli) -> Result<()> {
         Cmd::VerifyAudit => {
             let breaks = store.verify_audit().await?;
             if breaks.is_empty() {
-                eprintln!("{schema}: audit chains verify");
+                // Naming the algorithms matters: a reader whose regime
+                // recognises only one of them needs to know that one was
+                // actually checked, not infer it from silence (M3.16a).
+                eprintln!("{schema}: audit chains verify (sha256, sha3-256)");
             } else {
                 for b in &breaks {
                     eprintln!(
-                        "{schema}: {}/{} version {}: {}",
-                        b.rtype, b.id, b.version_id, b.detail
+                        "{schema}: {}/{} version {} [{}]: {}",
+                        b.rtype, b.id, b.version_id, b.algorithm, b.detail
                     );
                 }
                 bail!("{} history chain break(s) found", breaks.len());

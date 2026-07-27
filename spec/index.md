@@ -178,12 +178,50 @@ generation](#2-schema-generation), [Storage model](#3-storage-model),
   transaction as the data change — an audit record that can be lost
   independently of the change it describes is not an audit record.
 - **M3.16** History is **tamper-evident**. Each history row carries
-  `prev_hash bytea` and `row_hash bytea`, where `row_hash` is SHA-256 over
-  the row's canonical serialization concatenated with the `prev_hash` of the
-  previous version of the same resource id (the first version chains from 32
-  zero bytes). Chains are per resource id, so appends stay concurrent.
-  `fhirpg verify-audit` MUST recompute every chain and report the first
-  break.
+  `prev_hash bytea` and, for each hash algorithm of M3.16a, a digest column
+  over the row's canonical serialization concatenated with the previous
+  version's digest for the same algorithm and resource id (the first version
+  chains from that algorithm's length in zero bytes). Chains are per resource
+  id, so appends stay concurrent. `fhirpg verify-audit` MUST recompute every
+  chain in every algorithm and report the first break in each.
+- **M3.16a** The chain MUST be computed under **at least two hash algorithms
+  of different design families**, and MUST include **SHA-256** (Merkle–Damgård,
+  FIPS 180-4) and **SHA3-256** (sponge, FIPS 202).
+
+  The point is family diversity, not digest length. MD5 and SHA-1 both fell to
+  the same line of cryptanalysis, and both are Merkle–Damgård; two digests
+  drawn from one family would buy far less than their bit counts suggest. A
+  clinical record may be retained for decades — longer than anyone can
+  confidently promise a single hash function will stand — so the chain should
+  not rest on one construction.
+
+  Both named algorithms are FIPS-approved, so a strict regime is satisfied by
+  either. Where one must be named going forward, name **SHA-3**: NIST
+  published FIPS 202 precisely so that an approved hash would exist that is
+  not a SHA-2 variant.
+
+  Verification MUST recompute every configured algorithm and report each
+  separately rather than reducing them to a single verdict, so that a reader
+  can rely on whichever algorithm their regime recognises.
+
+  BLAKE3 (ARX tree) would add a third family and is deliberately **not**
+  required: it is absent from pgcrypto and from OpenSSL, so it cannot be
+  computed in the same statement as the insert, and computing it elsewhere
+  would cost the atomicity that makes this chain trustworthy. It is also not
+  FIPS-approved and MUST NOT be treated as the control of record where that
+  matters. Should pgcrypto gain it, M3.16a should be revisited.
+
+  Requiring SHA-3 makes **pgcrypto a required extension**. `fhirpg init` MUST
+  create it, and MUST fail with a message naming the extension if it cannot.
+
+  On an existing install, `init --upgrade` adds the new digest columns but
+  MUST NOT backfill them. The rows are recoverable and the digests could be
+  computed, but a chain assembled after the fact attests only that the rows
+  look consistent *now* — which is exactly what an attacker who rewrote them
+  would also produce. `verify-audit` MUST therefore report the new chain as
+  beginning where its first digest appears, the same treatment rows predating
+  the audit columns already receive. Manufacturing evidence is worse than
+  admitting its absence.
 - **M3.17** History is **append-only in the database, not merely by
   convention**. `fhirpg init` MUST emit a `BEFORE UPDATE OR DELETE` trigger
   on every history table that raises an exception, and the book MUST
@@ -445,8 +483,11 @@ generation](#2-schema-generation), [Storage model](#3-storage-model),
   wire echoes a submitted value (A7.11).
 - **T11.8** An audit test asserts that every write records its principal
   (M3.15), that every read appends an access record (PR12.5), that the hash
-  chain verifies (M3.16), and that a direct `UPDATE`/`DELETE` on a history
-  table is rejected by the database (M3.17).
+  chain verifies in every configured algorithm (M3.16, M3.16a), and that a
+  direct `UPDATE`/`DELETE` on a history table is rejected by the database
+  (M3.17). A test MUST also assert that tampering is caught **independently
+  by each algorithm**, since a chain that only ever fails in one of them
+  proves nothing about the others.
 
 ## 12. Trust, principal, and audit
 

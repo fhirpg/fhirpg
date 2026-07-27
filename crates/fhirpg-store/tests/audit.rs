@@ -202,9 +202,21 @@ async fn the_hash_chain_verifies_and_catches_tampering(store: &Store) {
         .expect("tamper");
 
     let breaks = store.verify_audit().await.expect("verify");
-    assert_eq!(breaks.len(), 1, "exactly the tampered version: {breaks:?}");
-    assert_eq!(breaks[0].id, "p4");
-    assert_eq!(breaks[0].version_id, 2);
+    // Every configured algorithm must catch it on its own (M3.16a). A chain
+    // that only ever failed under SHA-256 would prove nothing about SHA-3,
+    // and the whole point of a second design family is that it is not
+    // standing idle.
+    assert!(
+        breaks.iter().all(|b| b.id == "p4" && b.version_id == 2),
+        "only the tampered version should break: {breaks:?}"
+    );
+    for algorithm in ["sha256", "sha3-256"] {
+        assert!(
+            breaks.iter().any(|b| b.algorithm == algorithm),
+            "{algorithm} did not detect the tamper: {breaks:?}"
+        );
+    }
+    assert_eq!(breaks.len(), 2, "one break per algorithm: {breaks:?}");
 }
 
 async fn the_database_refuses_to_rewrite_history(store: &Store) {

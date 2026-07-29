@@ -59,6 +59,24 @@ steps:
   # while every local build stays green — a local build resolves the path
   # dependency and never fetches the registry copy — and it surfaces only
   # when someone packages a dependent.
+  # T11.9: adversarial input must be fuzzed, and the targets must be run.
+  # `search_sql` asserts that no attacker-controlled value reaches the SQL —
+  # every one must be a bind — which is the property that makes injection
+  # impossible rather than merely unlikely.
+  - name: fuzz
+    image: *rust
+    environment: *cargo_env
+    commands:
+      - rustup toolchain install nightly --profile minimal
+      - cargo install cargo-fuzz --locked
+      - |
+        for target in search_sql shred; do
+          mkdir -p /tmp/corpus/$target
+          cp fuzz/seeds/$target/* /tmp/corpus/$target/ 2>/dev/null || true
+          cargo +nightly fuzz run "$target" /tmp/corpus/$target -- \
+            -max_total_time=120 -rss_limit_mb=4096
+        done
+
   - name: published-versions
     image: *rust
     environment: *cargo_env

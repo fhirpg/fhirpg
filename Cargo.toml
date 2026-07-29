@@ -1,4 +1,7 @@
 [workspace]
+# The fuzz crate needs nightly-only libfuzzer-sys, so it stays out of the
+# workspace: a normal `cargo build` must not require a nightly toolchain.
+exclude = ["fuzz"]
 resolver = "3"
 members = [
     "crates/fhirpg-map",

@@ -45,6 +45,17 @@
   artifact, and checksums for every published binary. This is the IEC 62304
   / FDA cybersecurity expectation for a component handling clinical data,
   and it is cheap to keep green from the start.
+- **O10.11** A published version MUST match the source that claims it. A
+  crates.io version is immutable, so a tree carrying an already-published
+  version number MUST be byte-identical to what was published, and CI MUST
+  fail otherwise. Without the check the divergence is invisible: every local
+  build resolves the path dependency and never fetches the registry copy, so
+  the tree stays green while the artifact someone downloads is different
+  code. It surfaces only when a third party packages a dependent, as an
+  error about code they did not write. For a component handling clinical
+  data, "the released artifact is the reviewed source" is the claim the whole
+  audit trail rests on — O10.10's SBOM describes the artifact, and it is
+  worth nothing if the artifact is not the source.
 
 ---
 

@@ -10,22 +10,44 @@ use fhirpg_map::reconstruct::{InRow, ReconIn, reconstruct};
 use fhirpg_map::shred::{SqlVal, shred};
 use serde_json::Value;
 
+/// Where the FHIR example corpus lives, if it has been fetched.
+///
+/// `FHIRPG_CORPUS_DIR` first, then `corpus/` beside the workspace root —
+/// the same name and layout the CI fetch step creates, so a local run and a
+/// CI run look for it in the same place.
+///
+/// The previous fallback was an absolute path into one machine's temporary
+/// scratchpad. It resolved nowhere in CI, so this test silently skipped
+/// there, and on the one machine where the directory survived it resolved to
+/// an *empty* corpus — which failed the `total > 1000` assertion with
+/// "expected a real corpus" rather than skipping. A hardcoded absolute path
+/// makes a test pass, fail, or vanish depending on whose disk it runs on.
 fn corpus_root() -> Option<PathBuf> {
     let candidates = [
         std::env::var("FHIRPG_CORPUS_DIR").ok().map(PathBuf::from),
-        Some(PathBuf::from(
-            "/private/tmp/claude-501/-Users-jph-git-joelparkerhenderson-fhirpg/909837b9-87b5-4b52-a210-a96a407e5308/scratchpad/corpus",
-        )),
+        Some(workspace_root().join("corpus")),
     ];
     candidates.into_iter().flatten().find(|p| p.exists())
 }
 
+/// The workspace root, derived from this crate's manifest rather than the
+/// current directory, which `cargo test` does not guarantee.
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+}
+
+/// Where the FHIR definition bundles live, if they have been fetched.
+///
+/// `FHIRPG_SPEC_DIR` first, then `spec-cache/` beside the workspace root, to
+/// match the CI fetch step. The previous fallback pointed into a sibling
+/// checkout in one developer's home directory.
 fn spec_root() -> Option<PathBuf> {
     let candidates = [
         std::env::var("FHIRPG_SPEC_DIR").ok().map(PathBuf::from),
-        Some(PathBuf::from(
-            "/Users/jph/git/joelparkerhenderson/fhir-rust-crate/doc/fhir-specifications",
-        )),
+        Some(workspace_root().join("spec-cache")),
     ];
     candidates.into_iter().flatten().find(|p| p.exists())
 }
@@ -163,7 +185,28 @@ fn roundtrip_full_corpus() {
             all_failures.push(format!("[{sdir}] … and {} more", failures.len() - 40));
         }
     }
-    assert!(total > 1000, "expected a real corpus, ran {total}");
+    // A present-but-empty corpus directory is a fetch that did not happen,
+    // not a round-trip failure. Say which, so the next person does not read
+    // this as a data-fidelity bug.
+    assert!(
+        total > 1000,
+        "{}",
+        if total == 0 {
+            "the corpus directory exists but holds no stu3/r4/r5 examples: \
+             the fetch did not happen. Fetch it, or unset FHIRPG_CORPUS_DIR \
+             to skip this test."
+                .to_string()
+        } else {
+            // A partial corpus is the dangerous case: it runs, it passes its
+            // per-file checks, and it looks like coverage. The threshold is
+            // what stops 150 examples from standing in for 4,000.
+            format!(
+                "ran only {total} examples, expected the full corpus (>1000). \
+                 A partial corpus passes every file it does have and proves \
+                 much less than it appears to."
+            )
+        }
+    );
     assert!(
         all_failures.is_empty(),
         "round-trip failures:\n{}",

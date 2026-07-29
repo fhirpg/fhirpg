@@ -54,6 +54,37 @@ steps:
       - rustup toolchain install "$msrv" --profile minimal
       - cargo "+$msrv" check --workspace --all-targets --locked
 
+  # A crates.io version is immutable, so a version already published must
+  # match this tree. Otherwise the published artifact and the source diverge
+  # while every local build stays green — a local build resolves the path
+  # dependency and never fetches the registry copy — and it surfaces only
+  # when someone packages a dependent.
+  - name: published-versions
+    image: *rust
+    environment: *cargo_env
+    commands:
+      - version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+      - echo "workspace version is $version"
+      - fail=0
+      - |
+        for crate in fhirpg-map fhirpg-gen fhirpg-store fhirpg-server fhirpg; do
+          url="https://static.crates.io/crates/$crate/$crate-$version.crate"
+          if ! curl -sfL "$url" -o /tmp/pub.crate; then
+            echo "$crate $version: unpublished, nothing to compare"
+            continue
+          fi
+          rm -rf /tmp/pubx && mkdir -p /tmp/pubx
+          tar xzf /tmp/pub.crate -C /tmp/pubx
+          if diff -rq "/tmp/pubx/$crate-$version/src" "crates/$crate/src" >/dev/null 2>&1; then
+            echo "$crate $version: matches crates.io"
+          else
+            echo "ERROR: $crate $version is published but differs from this tree; bump it"
+            diff -rq "/tmp/pubx/$crate-$version/src" "crates/$crate/src" || true
+            fail=1
+          fi
+        done
+        exit "$fail"
+
   - name: book
     image: *rust
     environment: *cargo_env
